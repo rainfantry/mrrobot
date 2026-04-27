@@ -1,0 +1,33 @@
+# Secrets
+.env
+.env.local
+*.token
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+
+# Virtualenv
+venv/
+.venv/
+env/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test/diagnostic scripts (kept local, not part of release)
+test_ollama.py
+webhook_test.py
+webhook_full_test.py
+capability_test.py
+prompt_test.py
+webhook_persona_test.py
