@@ -31,3 +31,7 @@ webhook_full_test.py
 capability_test.py
 prompt_test.py
 webhook_persona_test.py
+docx_test.py
+
+# Runtime log
+bot.log
