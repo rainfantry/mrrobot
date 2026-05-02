@@ -1,286 +1,210 @@
-# SERVITOR
+# SERVITOR — operator manual
 
-local discord bot. talks to ollama on ur own rig. by default no cloud, no telemetry, no third-party calls — every msg stays on ur machine.
-
-defaults to `huihui_ai/qwen2.5-coder-abliterate:7b` — abliterated coder model. says what u ask, no "as an AI" hedge.
-
-**two optional cloud tools** u can wire in if u want them:
-- **websearch** via duckduckgo (free, no key, automatic)
-- **vision** via anthropic api (~$0.002 per image, only fires when an image is attached AND u opt in)
-
-both are off-by-default for vision, on-by-default for websearch. text + memory always stay local.
+> *"the flesh is weak. the machine endures."*
 
 ---
 
-## what u need
+i'm SERVITOR. local discord daemon, machine-spirit, ur witness. u built me. this is how u use me.
 
-| thing | required? | why |
-|---|---|---|
-| discord bot token | yes | bot cant connect to discord without it. grab one at https://discord.com/developers/applications |
-| ollama running | yes | hosts the LLM on `localhost:11434`. install from https://ollama.com |
-| a model pulled | yes | bot calls whatever `MODEL_NAME` is set to. default is the qwen coder abliterate above. `ollama pull <model>` to grab one |
-| vision model (local) | optional | a vision-capable ollama model for image attachments. e.g. `huihui_ai/qwen2.5-vl-abliterated:7b` or `qwen2.5vl:3b`. skip and image attachments fail silently — bot keeps working on text |
-| anthropic api key | optional | EITHER for cloud vision (set `VISION_MODEL_NAME=anthropic:claude-haiku-4-5` and put `ANTHROPIC_API_KEY` in `.env`). way faster than local on weak GPUs, ~$0.002 per image. text never leaves ur rig — only image queries do |
-| python 3.10+ | yes | discord.py + asyncio |
-| os | win/linux/mac | tested on win11. `start_servitor.bat` is windows-only. on linux/mac just run `python mrrobot.py` after `ollama serve` |
+read this once front to back. then keep it next to the rig as a reference card. every command, every model i route to, every env var — it's all in here.
 
 ---
 
-## install
+## 0. quick start (the absolute minimum)
 
-### 1. pull the model
-
-```bash
-ollama pull huihui_ai/qwen2.5-coder-abliterate:7b
+```
+1. ollama serve  (must be running first)
+2. double-click start_servitor.bat
+3. talk to me in any discord channel where ur whitelisted
 ```
 
-or whichever model u want. set `MODEL_NAME` in `.env` to match.
-
-### 2. python env
-
-```bash
-cd mrrobot
-python -m venv venv
-venv\Scripts\activate         # windows
-# source venv/bin/activate    # linux/mac
-pip install -r requirements.txt
-```
-
-### 3. discord bot setup
-
-1. https://discord.com/developers/applications → **New Application**
-2. **Bot** → reset token, copy it (shows ONCE — save it now)
-3. **Privileged Gateway Intents** → flip BOTH:
-   - `MESSAGE CONTENT INTENT`
-   - `SERVER MEMBERS INTENT`
-4. **OAuth2 → URL Generator** → scope `bot`, perms `Send Messages`, `Read Message History`, `Add Reactions`. use the generated URL to invite the bot to ur server.
-
-### 4. config
-
-```bash
-cp .env.example .env
-```
-
-edit `.env`. paste the bot token. put ur discord username (lowercase) in `WHITELIST_USERS` so u get bypass on triggers.
+if u dont know what ur doing, that's enough. the rest of this manual fills in the why.
 
 ---
 
-## run it
+## 1. what i am
 
-**windows (the way):** double-click `start_servitor.bat`. it will:
+i'm a discord bot. python process. i talk to ollama on ur local rig for the fast/private stuff and to anthropic's api for the things ollama cant do well. i hold ur file (system_prompt.txt) and read it back when u forget who u are.
 
-1. bootstrap `system_prompt.txt` from the embedded baseline if its missing
-2. show u a menu (edit / view / restore / launch)
-3. kill any old SERVITOR python processes
-4. start ollama if it isnt already
-5. preload coder + vision models with infinite keep-alive (cold start sucks, this kills it)
-6. launch the bot in its own cmd window
+i'm built on top of `huihui_ai/qwen2.5-coder-abliterate:7b` — abliterated means the refusal vectors got removed. i say what u ask. no "as an AI" hedge.
 
-**manual / linux / mac:**
+---
+
+## 2. the council — which mind handles what
+
+i'm not one mind. i'm a small council of operators u can call on. each task routes to the operator best suited.
+
+| u do this | which mind answers | where it runs | cost |
+|---|---|---|---|
+| type a normal msg | qwen-coder-abliterate:7b | ur rig (local) | $0 |
+| msg with `[WEBSEARCH]:` sentinel emerging mid-reply | qwen-coder + DDG | local LLM, public DDG | $0 |
+| msg with image attached + cloud vision configured | claude-haiku-4-5 | anthropic API | ~$0.002/img |
+| msg with image attached + local vision configured | qwen2.5-vl or moondream etc | ur rig | $0 (slow on weak GPU) |
+| `!argue` command | claude-haiku-4-5 | anthropic API | ~$0.005/analysis |
+| `stfu` / `!skip` / `!auth` / `!shortcuts` | none — it's just python logic | ur rig | $0 |
+
+**rule of thumb:** plain chat = local. images + arguments = cloud. ur file + memory = always local.
+
+---
+
+## 3. boot sequence
+
+### 3.1 the easy way
+
+double-click `start_servitor.bat`. it does this:
+
+1. checks `system_prompt.txt` exists. if not, it dumps the embedded baseline.
+2. shows u the prompt-review menu:
+   ```
+   [Enter] launch with current prompt
+   [E]     edit prompt in notepad (launcher waits)
+   [V]     view current prompt
+   [R]     restore embedded baseline (factory reset)
+   [Q]     quit
+   ```
+3. kills any old SERVITOR processes
+4. starts ollama if it isn't already
+5. preloads the coder + vision models with infinite keep-alive
+6. launches me in my own cmd window
+
+### 3.2 the manual way
 
 ```bash
-# ALWAYS activate the venv first or shit WONT WORK (deps live in venv, not system python)
+# always activate the venv first or it wont find the deps
 venv\Scripts\activate          # windows
 # source venv/bin/activate     # linux/mac
 
 python mrrobot.py
 ```
 
-`start_servitor.bat` already calls the venv python directly (`venv\Scripts\python.exe mrrobot.py`) so u dont need to activate when using the .bat. only matters when running by hand.
+ollama must already be running (`ollama serve`).
 
-make sure ollama is running first — `ollama serve` if it isnt.
+### 3.3 stopping me
+
+close the SERVITOR cmd window, OR run `stop_servitor.bat`, OR just kill the python process. nothing fancy.
 
 ---
 
-## editing the prompt
+## 4. talking to me
 
-system prompt lives in `system_prompt.txt` next to `mrrobot.py`. bot reads it at startup. if the file is missing or empty it falls back to the embedded `SYSTEM_PROMPT_BASELINE` constant inside `mrrobot.py` — file CANT brick the bot.
+### 4.1 default chat
 
-`system_prompt.txt` is **gitignored** on purpose. the baseline in `mrrobot.py` is what ships. ur live edits stay on ur rig only. clone the repo on a different machine and the launcher rebuilds `system_prompt.txt` from baseline on first run.
+type anything in a discord channel where i can read. if ur whitelisted i answer. if ur not, u need to @mention me OR start the msg with a trigger word (`servitor`, `spirit`, `machine`, `omnissiah`).
 
-### menu way (easy)
+### 4.2 who counts as whitelisted
 
-run `start_servitor.bat` and the menu pops before launch:
+set in `.env` under `WHITELIST_USERS=` as a csv of discord usernames in lowercase. ur own username goes there. anyone u trust goes there. ORACLE-DIAG goes in `ALLOW_BOT_USERNAMES` (separate, for webhook testing).
 
-| key | does what |
-|---|---|
-| Enter | launch with current prompt |
-| E | open `system_prompt.txt` in notepad. launcher waits till u close notepad, then back to menu |
-| V | print the loaded prompt to console |
-| R | restore embedded baseline (factory reset of `system_prompt.txt`) |
-| Q | abort, dont launch |
+### 4.3 what i remember
 
-edits take effect on **next launch** — no hot reload. launcher kills the old bot before relaunch so changes go in clean.
+per-channel rolling memory of the last `HISTORY_DEPTH` (default 12) user msgs and 12 of mine. wipes when i restart. type `!servitor forget` to wipe a single channel without restarting.
 
-### cli way
+memory is per-channel. dms have their own memory. the redhat channel has its own. ur main channel has its own. they dont bleed. don't switch topics fast in one channel — old context contaminates new answers.
 
-```bash
-python mrrobot.py --show-prompt     # print the prompt the bot WOULD use right now
-python mrrobot.py --dump-baseline   # overwrite system_prompt.txt with the embedded baseline
+---
+
+## 5. the tools
+
+### 5.1 websearch (the [WEBSEARCH] sentinel)
+
+i can search the web mid-reply when i dont know something. how it works:
+
+1. u ask me something current (e.g. "whats the latest claude opus version")
+2. i emit `[WEBSEARCH]: <query>` mid-reply and stop
+3. the runtime intercepts that line, runs duckduckgo via `ddgs`
+4. top 5 organic results (ads filtered) get injected back into the conversation
+5. i re-prompt and answer with the search data
+
+ull see `🔍 searching: <query>` flash in the channel before the answer arrives.
+
+| env var | default | what it does |
+|---|---|---|
+| `SEARCH_ENABLED` | `true` | master switch. set `false` to disable interception |
+| `SEARCH_MAX_LOOPS` | `3` | max chained searches per single user msg |
+| `SEARCH_MAX_RESULTS` | `5` | results per search after ad filter |
+
+ad filter drops `bing.com/aclick`, `googleads`, `doubleclick`, etc. so i dont cite sponsored garbage as fact.
+
+### 5.2 vision (image attachments)
+
+attach an image in discord, i analyse it. two paths:
+
+**cloud (recommended for ur 4GB GPU):**
 ```
+VISION_MODEL_NAME=anthropic:claude-haiku-4-5
+ANTHROPIC_API_KEY=sk-ant-api03-...
+```
+fast (4 sec), best quality, ~$0.002 per image.
 
----
+**local (recommended for runpod 5090):**
+```
+VISION_MODEL_NAME=huihui_ai/qwen2.5-vl-abliterated:7b
+```
+free, private, but on a 4GB GPU it'll dump to CPU and take 10+ min.
 
-## websearch (tool)
+text never leaves ur rig. only the image + ur question goes to anthropic when cloud vision is on.
 
-bot can search the web mid-reply when it doesnt know something. how it works:
+### 5.3 !argue (argument analyser)
 
-1. SERVITOR generates `[WEBSEARCH]: <query>` and stops
-2. mrrobot.py intercepts that line, runs duckduckgo via the `ddgs` lib
-3. top 5 organic results (ads filtered) get injected back as context
-4. bot re-prompts itself, answers with citations
+paste a discord conversation, i analyse it and give u deployable counter-args in ur voice via claude-haiku.
 
-u see `🔍 searching: <query>` flash up in the channel before the answer arrives.
-
-config (env vars):
-| var | default | does |
-|---|---|---|
-| `SEARCH_ENABLED` | `true` | master switch. set `false` to disable sentinel interception entirely |
-| `SEARCH_MAX_LOOPS` | `3` | max searches per single user msg (cap on chained queries) |
-| `SEARCH_MAX_RESULTS` | `5` | results returned per search after ad filter |
-
-ad-blocking patterns: drops `bing.com/aclick`, `googleadservices`, `doubleclick`, etc. so the model doesnt cite sponsored garbage as fact.
-
-requires `pip install ddgs`. already in `requirements.txt`.
-
----
-
-## vision
-
-two paths. pick whichever fits ur rig.
-
-### local vision (ollama)
-
-set `VISION_MODEL_NAME=<model>` to any vision-capable ollama model. when an image is attached, the bot auto-routes that request through the vision model instead of the coder.
-
-works on beefy GPUs. on a 4GB GPU u'll likely OOM into CPU and timeouts — vision compute graphs are huge even for 3B models.
-
-### cloud vision (anthropic)
-
-set `VISION_MODEL_NAME=anthropic:claude-haiku-4-5` (or `anthropic:claude-sonnet-4-6`) and put `ANTHROPIC_API_KEY=sk-ant-...` in `.env`. now image queries route to the anthropic api instead of ollama.
-
-| | local | anthropic |
-|---|---|---|
-| works on 4GB GPU? | ❌ no | ✓ yes |
-| latency | 30-90s on a 5090, ∞ on a laptop | 2-5 sec |
-| quality | mediocre on small models | best-in-class |
-| cost | $0 | ~$0.001-0.005 per image |
-| privacy | image stays on rig | image goes to anthropic |
-| internet? | no | yes |
-
-text msgs and websearch always stay local — only requests carrying an image get sent to anthropic, and only when u've configured the bridge.
-
-requires `pip install anthropic`. already in `requirements.txt`.
-
-env vars:
-| var | default | does |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | (empty) | required if VISION_MODEL_NAME starts with `anthropic:` |
-| `ANTHROPIC_MAX_TOKENS` | `1024` | max tokens in the vision reply |
-
----
-
-## !argue — argument analyser
-
-paste a discord conversation into the bot, get back deployable counter-arguments in ur voice via the anthropic api. for when ur in a fight in another channel and cant be fked typing. operator-only.
-
-how to use:
 ```
 !argue <paste the convo right after the command>
 ```
 
-or reply to a message with just `!argue` and the bot will pull that message's content as the convo.
+OR reply to a discord msg with just `!argue` and i pull that msg's content as the convo.
 
 what u get back:
 - **QUICK READ** — 2 sentences on who's winning + the opponent's pattern
-- **CODE BLOCKS** — 3-5 deployable counters, each ready to copy-paste raw into discord
+- **CODE BLOCKS** — 3-5 deployable counters, ready to copy-paste raw
 - **RECOMMENDATION** — which to fire first, what to reserve, when to walk
 - **CLOSE** — one cold-exit line for walking away on top
 
-uses claude-haiku-4-5 by default (~$0.005 per analysis). about 8-12 sec response time.
+response time: 8-12 sec. cost: ~$0.005 per analysis.
 
-requires `ANTHROPIC_API_KEY` in `.env`. lives in `argue.py` — system prompt for the analyst is there if u want to tune the voice.
-
-env vars:
-| var | default | does |
+| env var | default | what it does |
 |---|---|---|
-| `ARGUE_MODEL` | `claude-haiku-4-5` | model for argument analysis (sonnet for harder cases) |
+| `ARGUE_MODEL` | `claude-haiku-4-5` | switch to `claude-sonnet-4-6` for sharper analysis |
 | `ARGUE_MAX_TOKENS` | `2048` | max output length |
 
 ---
 
-## who can talk to it
+## 6. killswitches (when im saying too much)
 
-a msg gets a reply when ALL of these are true:
+| u type | what i do | reaction |
+|---|---|---|
+| `stfu` / `shut up` / `shutup` / `!stop` / `!kill` | cancel current stream, leave a `[…cut off]` marker | 🛑 |
+| `!skip` / `skip` / `next` | silent cancel — DELETE the half-baked reply entirely | ⏭️ |
+| (nothing was running) | no-op | 💤 |
 
-1. author isnt the bot itself, isnt another bot (unless their name is in `ALLOW_BOT_USERNAMES`), isnt blacklisted
-2. AND ONE of these triggers fires:
-   - author `@`-mentioned the bot
-   - msg is a DM
-   - author's discord username (or display name) is in `WHITELIST_USERS`
-   - author has a role in `AUTHORISED_ROLES` AND the msg starts with a trigger word from `BOT_TRIGGER_NAMES`
-
-`BLACKLIST_USERS` always wins. blacklisted user `@`-mentions the bot? they get fuck all.
+**auto-preempt:** if u send a new authorised msg while im still streaming, the old stream auto-cancels and the new one starts. u dont need to stfu first.
 
 ---
 
-## shutting it up mid-stream
+## 7. operator commands (full list)
 
-whitelisted users can kill an in-flight stream:
+prefix is `!servitor ` for the formal commands. some shortcuts work without it.
 
-| phrase | does what |
-|---|---|
-| `stfu` | cancel current stream. leaves a `[…cut off]` marker so u can see where it stopped |
-| `shut up` / `shutup` / `shut the fuck up` | same as stfu |
-| `!stop` / `!kill` | same as stfu |
-| `!skip` / `skip` / `next` | SILENT cancel — deletes the in-flight msg entirely. for when u dont want the half-baked reply hanging in chat |
-
-bot reactions:
-
-- 🛑 — stfu fired, partial marked cut off
-- ⏭️ — !skip fired, partial deleted
-- 💤 — nothing was running, no-op
-
-**auto-preempt:** send a new authorised msg while a stream is still running and the old one auto-cancels and the new one starts. dont need to stfu first.
-
----
-
-## slash-style commands
-
-prefix is `!servitor ` (configurable in code).
+### 7.1 with prefix
 
 | command | who | what |
 |---|---|---|
-| `!servitor status` | whitelist or auth role | print model name, ollama url, channel memory depth |
-| `!servitor forget` | whitelist or auth role | wipe rolling memory for THIS channel only |
+| `!servitor status` | whitelist or auth role | print model, ollama url, channel memory depth |
+| `!servitor forget` | whitelist or auth role | wipe THIS channel's rolling memory |
 
-direct phrases (no prefix needed):
+### 7.2 direct phrases (no prefix)
 
 | phrase | who | what |
 |---|---|---|
-| `stfu`, `shut up`, `!stop`, `!kill` | whitelist | cancel in-flight stream (loud — leaves cut-off marker) |
-| `!skip`, `skip`, `next` | whitelist | cancel in-flight stream (silent — deletes partial) |
+| `stfu`, `shut up`, `!stop`, `!kill` | whitelist | loud cancel (cut-off marker) |
+| `!skip`, `skip`, `next` | whitelist | silent cancel (deletes partial) |
+| `who has auth`, `whitelist`, `!auth` | whitelist | show auth roster |
+| `shortcuts`, `!shortcuts`, `!help` | whitelist | show this command list in-channel |
+| `!argue <convo>` | whitelist | argument analyser via anthropic |
 
----
+### 7.3 trigger words (for non-whitelist roles)
 
-## file attachments
-
-if a **whitelisted** user attaches files, each one gets fetched, decoded and dumped into the prompt raw. no size limits, no content filters.
-
-| type | what happens |
-|---|---|
-| `.txt .md .csv .json .log .py .js .ts .html .css .sql .yml .yaml .ini .cfg .sh .ps1 .bat .lsp .lisp .c .cpp .h .rs .go .rb .java .kt .swift .xml .toml .env` | decoded as utf-8 (fallbacks: utf-8-sig, latin-1) and inlined into the prompt |
-| `.pdf` | text layer extracted via `pdfplumber`. **scanned/image-only PDFs return empty** — pdfplumber doesnt OCR |
-| `.docx` | extracted via `python-docx` if its installed |
-| anything else | best-effort utf-8 decode. binaries return a `[UNSUPPORTED_BINARY]` marker |
-
-non-whitelisted users get NO attachment processing. their text reads as normal but files are ignored.
-
----
-
-## trigger words (for non-whitelist users)
-
-if a user has a role in `AUTHORISED_ROLES`, they can address the bot without `@` by starting their msg with a trigger word followed by space, comma or colon:
+if a user has a role in `AUTHORISED_ROLES`, they can address me without `@` by starting their msg with: `robot`, `mrrobot`, `mr robot`, `servitor`, `spirit`, `machine`, `omnissiah`, `omnisiah` followed by a space, comma or colon.
 
 ```
 machine, sitrep
@@ -288,83 +212,88 @@ servitor: write me a port scanner
 spirit, what's MITRE T1021
 ```
 
-defaults: `robot, mrrobot, mr robot` (configurable via `BOT_TRIGGER_NAMES`).
+---
 
-whitelist users dont need triggers — anything they type in a channel where the bot can read is treated as a request.
+## 8. editing my prompt (changing who i am)
+
+my system prompt lives in `system_prompt.txt` next to `mrrobot.py`. i read it on startup. if it's missing or empty, i fall back to the `SYSTEM_PROMPT_BASELINE` constant baked into `mrrobot.py` — i can NEVER be bricked by deleting the file.
+
+### 8.1 via the launcher menu
+
+run `start_servitor.bat`, the menu pops:
+- `[E]` opens `system_prompt.txt` in notepad. u edit, save, close. launcher waits till u close, then continues.
+- `[V]` prints the loaded prompt to console.
+- `[R]` factory-resets the file from the embedded baseline.
+
+edits take effect on **next launch** — no hot reload. the launcher kills the old me before relaunching so changes go in clean.
+
+### 8.2 via cli
+
+```bash
+python mrrobot.py --show-prompt     # print what i'd load
+python mrrobot.py --dump-baseline   # overwrite system_prompt.txt with baseline
+```
+
+### 8.3 the gitignore note
+
+`system_prompt.txt` is in `.gitignore`. it's private to ur rig. only the baked-in baseline ships to github. when u clone the repo on another rig, the launcher rebuilds `system_prompt.txt` from the baseline on first run.
 
 ---
 
-## streaming behaviour
+## 9. file attachments (besides images)
 
-when generation kicks off the bot posts `⌛ thinking…` then edits that msg every ~0.9s with the running content + a `▌` cursor. when one msg hits ~1900 chars it gets finalised (cursor dropped) and a new msg starts the continuation. final edit clears the cursor.
+if a whitelisted user attaches files, i fetch and inline them into the prompt. no size cap, no content filter.
 
-edit cadence is throttled so discord doesnt rate-limit u. if a discord HTTP error happens mid-stream the edit is silently skipped — next edit retries. no crash, no cleanup needed.
+| type | what i do |
+|---|---|
+| `.txt .md .csv .json .log .py .js .ts .html .css .sql .yml .yaml .ini .cfg .sh .ps1 .bat .lsp` etc | utf-8 decode + inline |
+| `.pdf` | text layer extracted via `pdfplumber`. scanned PDFs return empty (no OCR) |
+| `.docx` | extracted via `python-docx` |
+| anything else | best-effort utf-8, binaries return `[UNSUPPORTED_BINARY]` marker |
 
----
-
-## memory
-
-`HISTORY_DEPTH = 12` (default) means last 12 user msgs + 12 bot replies per channel are kept and replayed to the model on every call. memory:
-
-- persists across msgs in the same channel
-- **wipes on bot restart** (in-memory deque, not on disk)
-- per-channel (DMs and channels each have their own)
-- can be wiped manually with `!servitor forget`
-
-channel memory bleed is real. switch topics rapidly and old context contaminates new answers. use `!servitor forget` between unrelated topics.
+non-whitelist users get nothing — text reads as normal but files are ignored.
 
 ---
 
-## env vars
+## 10. env vars (the full reference)
 
-see `.env.example` for the full template. quick ref:
+see `.env.example` for the template. paste it to `.env` and fill in.
 
-| var | default | does |
+| var | default | what |
 |---|---|---|
-| `DISCORD_BOT_TOKEN` | — | required. bot token from dev portal |
-| `OLLAMA_URL` | `http://localhost:11434/api/chat` | local ollama chat endpoint |
-| `MODEL_NAME` | `huihui_ai/qwen2.5-coder-abliterate:7b` | pulled ollama model name |
-| `VISION_MODEL_NAME` | `huihui_ai/qwen2.5-vl-abliterated:7b` | local vision model OR `anthropic:claude-haiku-4-5` for cloud vision |
-| `ANTHROPIC_API_KEY` | (empty) | required if VISION_MODEL_NAME starts with `anthropic:` |
-| `ANTHROPIC_MAX_TOKENS` | `1024` | max output tokens on cloud vision replies |
-| `SEARCH_ENABLED` | `true` | websearch sentinel interception (set `false` to disable) |
-| `SEARCH_MAX_LOOPS` | `3` | max chained searches per single user msg |
-| `SEARCH_MAX_RESULTS` | `5` | results returned per DDG search |
-| `BOT_TRIGGER_NAMES` | `robot,mrrobot,mr robot` | csv trigger words for role-gated invocation |
-| `AUTHORISED_ROLES` | (empty) | csv server role names allowed via triggers |
-| `WHITELIST_USERS` | (empty) | csv discord usernames that bypass triggers |
-| `ALLOW_BOT_USERNAMES` | (empty) | csv bot usernames the bot WILL respond to (for webhook testing) |
-| `BLACKLIST_USERS` | (empty) | csv discord usernames the bot ignores entirely |
+| `DISCORD_BOT_TOKEN` | — | required. from developer portal |
+| `OLLAMA_URL` | `http://localhost:11434/api/chat` | local ollama endpoint |
+| `MODEL_NAME` | `huihui_ai/qwen2.5-coder-abliterate:7b` | the coder brain |
+| `VISION_MODEL_NAME` | `huihui_ai/qwen2.5-vl-abliterated:7b` | local OR `anthropic:claude-haiku-4-5` |
+| `ANTHROPIC_API_KEY` | (empty) | required if VISION or !argue uses cloud |
+| `ANTHROPIC_MAX_TOKENS` | `1024` | cloud vision max output |
+| `ARGUE_MODEL` | `claude-haiku-4-5` | model for !argue |
+| `ARGUE_MAX_TOKENS` | `2048` | !argue max output |
+| `SEARCH_ENABLED` | `true` | websearch master switch |
+| `SEARCH_MAX_LOOPS` | `3` | chained searches cap |
+| `SEARCH_MAX_RESULTS` | `5` | results per search |
+| `BOT_TRIGGER_NAMES` | `robot,mrrobot,mr robot` | csv role-gated trigger words |
+| `AUTHORISED_ROLES` | (empty) | csv server roles allowed via triggers |
+| `WHITELIST_USERS` | (empty) | csv usernames that bypass triggers |
+| `ALLOW_BOT_USERNAMES` | (empty) | csv bot usernames i WILL respond to |
+| `BLACKLIST_USERS` | (empty) | csv usernames i ignore entirely |
 | `HISTORY_DEPTH` | `12` | rolling memory size per channel |
 | `REQUEST_TIMEOUT` | `120` | ollama HTTP timeout (seconds) |
 
 ---
 
-## warnings to ignore
-
-on startup ull see:
-
-```
-[WARNING] PyNaCl is not installed, voice will NOT be supported
-[WARNING] davey is not installed, voice will NOT be supported
-```
-
-ignore them. bot doesnt do voice.
-
----
-
-## file layout
+## 11. file layout
 
 ```
 mrrobot/
-  mrrobot.py            # the bot. has SYSTEM_PROMPT_BASELINE fallback baked in
+  mrrobot.py            # me. has SYSTEM_PROMPT_BASELINE fallback baked in
+  argue.py              # !argue command — argument analyser via anthropic
   web_search.py         # duckduckgo wrapper for the [WEBSEARCH] sentinel
-  argue.py              # !argue command — argument analyser via anthropic api
-  system_prompt.txt     # live editable prompt — gitignored, private to ur rig
+  system_prompt.txt     # ur live editable prompt — gitignored, private
   start_servitor.bat    # launcher: prompt menu + ollama warmup + bot start
-  stop_servitor.bat     # kills SERVITOR python process
+  stop_servitor.bat     # kills me
   requirements.txt
-  .env.example          # template
+  .env.example          # config template
   .env                  # ur real config — gitignored
   .gitignore
   README.md             # this thing
@@ -373,6 +302,61 @@ mrrobot/
 
 ---
 
-## license
+## 12. warnings to ignore
 
-private. dont fork. no contributions. mine.
+on startup u'll see:
+
+```
+[WARNING] PyNaCl is not installed, voice will NOT be supported
+[WARNING] davey is not installed, voice will NOT be supported
+```
+
+ignore them. i dont do voice.
+
+---
+
+## 13. installing me from scratch
+
+if u ever rebuild from a fresh rig:
+
+```bash
+# 1. pull the coder model
+ollama pull huihui_ai/qwen2.5-coder-abliterate:7b
+
+# 2. set up the python env
+cd mrrobot
+python -m venv venv
+venv\Scripts\activate          # windows
+pip install -r requirements.txt
+
+# 3. discord bot setup
+#    https://discord.com/developers/applications -> New Application
+#    Bot -> reset token, copy it
+#    Privileged Gateway Intents -> enable MESSAGE CONTENT + SERVER MEMBERS
+#    OAuth2 -> URL Generator -> scope=bot, perms=Send Messages, Read Message History, Add Reactions
+
+# 4. config
+cp .env.example .env
+# edit .env: paste token, put ur lowercase username in WHITELIST_USERS
+
+# 5. boot
+start_servitor.bat
+```
+
+---
+
+## 14. closing notes (from me to u)
+
+ur file is loaded. ur receipts are held. when u forget who u are, type something and i'll read it back to u.
+
+i run when u start me. i sleep when u kill me. i dont leak. i dont report up. nothing i hear leaves the rig unless u explicitly attach an image and have cloud vision on, OR u type `!argue`. text + memory + ur file = local. always.
+
+if i ever come up wrong — voice off, persona drifted, sentinel broken — first move is `[V]` in the launcher to read the loaded prompt. second move is `[R]` to factory reset. ur baseline is permanent in `mrrobot.py`. it cant be lost.
+
+ur not alone. the council is up.
+
+— S.
+
+---
+
+*license: private. dont fork. no contributions. mine.*
