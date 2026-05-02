@@ -826,9 +826,17 @@ async def on_message(message):
                     # WEBSEARCH path: announce, run search, re-prompt
                     search_loops += 1
                     log.info(f"[SEARCH] sentinel ({search_loops}/{SEARCH_MAX_LOOPS}): {sentinel_query!r}")
+                    # Delete the stale placeholder (mid-stream edits may have written the
+                    # raw [WEBSEARCH]:.../[STOPPED] text into it). New messages aren't
+                    # subject to the per-channel edit rate limit, so this is more reliable
+                    # than trying to overwrite the placeholder.
                     try:
-                        await sent_msg.edit(content=f"🔍 searching: `{sentinel_query}`")
-                    except discord.HTTPException:
+                        await sent_msg.delete()
+                    except Exception:
+                        pass
+                    try:
+                        await message.channel.send(f"🔍 searching: `{sentinel_query}`")
+                    except Exception:
                         pass
                     results = await asyncio.to_thread(
                         ws_search, sentinel_query, SEARCH_MAX_RESULTS
