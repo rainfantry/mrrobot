@@ -1,203 +1,186 @@
 # SERVITOR
 
-A fully-offline Discord chat daemon backed by a local Ollama LLM. No cloud APIs, no telemetry, no third-party calls — once the model is pulled and the bot is running, every message stays on your rig.
+local discord bot. talks to ollama on ur own rig. no cloud, no telemetry, no openai, no anthropic. once u pull the model and start the bot, every msg stays on ur machine.
 
-Built around an abliterated coder model (`huihui_ai/qwen2.5-coder-abliterate:7b` by default) for raw, unfiltered code/security/sysadmin sparring.
+defaults to `huihui_ai/qwen2.5-coder-abliterate:7b` — abliterated coder model. says what u ask, no "as an AI" hedge.
 
 ---
 
-## Requirements
+## what u need
 
-| Requirement | Status | Purpose |
+| thing | required? | why |
 |---|---|---|
-| **Discord bot token** | REQUIRED | Auth for the Discord gateway. Without it the bot exits at startup with `DISCORD_BOT_TOKEN not set`. Get one at https://discord.com/developers/applications |
-| **Ollama running locally** | REQUIRED | Hosts the LLM. Default endpoint `http://localhost:11434`. Install from https://ollama.com |
-| **An Ollama model pulled** | REQUIRED | The bot calls whatever `MODEL_NAME` points to. Default `huihui_ai/qwen2.5-coder-abliterate:7b`. Pull with `ollama pull <model>` |
-| **Vision model (optional)** | OPTIONAL | If users attach images, the bot routes them to `VISION_MODEL_NAME` (default `huihui_ai/qwen2.5-vl-abliterated:7b`). Skip if you don't need image input — image attachments will just fail silently. |
-| **Anthropic API key** | OPTIONAL — future | The Oracle Bridge in the system prompt is currently MANUAL: the bot prints a query, the operator pastes the answer back. If you want to automate that bridge — calling Claude via the Anthropic SDK to fetch live data — you would need an `ANTHROPIC_API_KEY` set in `.env`. **Not implemented yet** — the prompt's bridge protocol assumes a human relay. Set this only if you build the auto-relay yourself. |
-| **Python 3.10+** | REQUIRED | Discord.py + asyncio + typing |
-| **OS** | Linux / macOS / Windows | Tested on Windows 11. The included `start_servitor.bat` is Windows-only; on Linux/macOS just `python mrrobot.py` after `ollama serve`. |
+| discord bot token | yes | bot cant connect to discord without it. grab one at https://discord.com/developers/applications |
+| ollama running | yes | hosts the LLM on `localhost:11434`. install from https://ollama.com |
+| a model pulled | yes | bot calls whatever `MODEL_NAME` is set to. default is the qwen coder abliterate above. `ollama pull <model>` to grab one |
+| vision model | optional | if u want it to look at images. default `huihui_ai/qwen2.5-vl-abliterated:7b`. skip it and image attachments just fail silently — bot keeps working |
+| anthropic api key | optional, future | the bot's system prompt has an "Oracle Bridge" — when it doesnt know something post-training-cutoff, it prints a query and waits for u to paste back a real answer. currently MANUAL. if u ever automate the bridge ull need an `ANTHROPIC_API_KEY` in `.env`. not implemented yet, just leaving the door open |
+| python 3.10+ | yes | discord.py + asyncio |
+| os | win/linux/mac | tested on win11. `start_servitor.bat` is windows-only. on linux/mac just run `python mrrobot.py` after `ollama serve` |
 
 ---
 
-## Features
+## install
 
-- **100% offline.** All inference happens locally via Ollama.
-- **Live streaming.** Replies stream token-by-token into Discord — bot edits its own message as the model generates, with a `▌` cursor and clean splitting at the 2000-char message cap.
-- **Per-channel memory.** Rolling deque of the last N exchanges per channel.
-- **Whitelist + blacklist** of Discord usernames.
-- **Trigger words** for role-gated invocation without `@`.
-- **File parsing** for whitelisted operators: `.txt .md .csv .json .log .py .js .ts .html .css .sql .yml .yaml .ini .cfg .sh .ps1 .bat .lsp` and more, plus **PDF** text extraction via `pdfplumber`.
-- **Killswitch.** Type `stfu` (and friends) to instantly cancel an in-flight stream.
-- **Auto-preempt.** Sending a new message while the bot is still generating cancels the old stream and starts a new one.
-
----
-
-## Install
-
-### 1. Pull the model
+### 1. pull the model
 
 ```bash
 ollama pull huihui_ai/qwen2.5-coder-abliterate:7b
 ```
 
-(Or whichever model you want. Set `MODEL_NAME` in `.env` to match.)
+or whichever model u want. set `MODEL_NAME` in `.env` to match.
 
-### 2. Python environment
+### 2. python env
 
 ```bash
 cd mrrobot
 python -m venv venv
-venv\Scripts\activate     # Windows
-# source venv/bin/activate # Linux/Mac
+venv\Scripts\activate         # windows
+# source venv/bin/activate    # linux/mac
 pip install -r requirements.txt
 ```
 
-### 3. Discord bot setup
+### 3. discord bot setup
 
-1. Go to https://discord.com/developers/applications → **New Application**
-2. **Bot** → reset token, copy it
-3. **Privileged Gateway Intents** → enable both:
+1. https://discord.com/developers/applications → **New Application**
+2. **Bot** → reset token, copy it (shows ONCE — save it now)
+3. **Privileged Gateway Intents** → flip BOTH:
    - `MESSAGE CONTENT INTENT`
    - `SERVER MEMBERS INTENT`
-4. **OAuth2 → URL Generator** → scope `bot` + permissions `Send Messages`, `Read Message History`, `Add Reactions`. Use the URL to invite the bot to your server.
+4. **OAuth2 → URL Generator** → scope `bot`, perms `Send Messages`, `Read Message History`, `Add Reactions`. use the generated URL to invite the bot to ur server.
 
-### 4. Config
+### 4. config
 
 ```bash
 cp .env.example .env
-# edit .env, paste your bot token, set WHITELIST_USERS to your Discord username (lowercase)
 ```
 
-### 5. Run
+edit `.env`. paste the bot token. put ur discord username (lowercase) in `WHITELIST_USERS` so u get bypass on triggers.
 
-**Recommended (Windows):** double-click `start_servitor.bat`. It will:
+---
 
-1. Bootstrap `system_prompt.txt` from the embedded baseline if missing.
-2. Show a prompt-review menu (edit / view / restore / launch).
-3. Kill any stale SERVITOR processes.
-4. Start Ollama if it isn't running and wait for port 11434.
-5. Preload the coder + vision models with permanent keep-alive.
-6. Launch the bot in its own window.
+## run it
 
-**Manual:**
+**windows (the way):** double-click `start_servitor.bat`. it will:
+
+1. bootstrap `system_prompt.txt` from the embedded baseline if its missing
+2. show u a menu (edit / view / restore / launch)
+3. kill any old SERVITOR python processes
+4. start ollama if it isnt already
+5. preload coder + vision models with infinite keep-alive (cold start sucks, this kills it)
+6. launch the bot in its own cmd window
+
+**manual / linux / mac:**
 
 ```bash
 python mrrobot.py
 ```
 
-Make sure Ollama is running first (`ollama serve` if it isn't already).
+make sure ollama is running first — `ollama serve` if it isnt.
 
 ---
 
-## Editing the system prompt
+## editing the prompt
 
-The full system prompt lives in **`system_prompt.txt`** next to `mrrobot.py`. The bot reads it at startup. If the file is missing or empty it falls back to the embedded `SYSTEM_PROMPT_BASELINE` constant in `mrrobot.py` — the file can never brick the bot.
+system prompt lives in `system_prompt.txt` next to `mrrobot.py`. bot reads it at startup. if the file is missing or empty it falls back to the embedded `SYSTEM_PROMPT_BASELINE` constant inside `mrrobot.py` — file CANT brick the bot.
 
-### Via the launcher (easy)
+`system_prompt.txt` is **gitignored** on purpose. the baseline in `mrrobot.py` is what ships. ur live edits stay on ur rig only. clone the repo on a different machine and the launcher rebuilds `system_prompt.txt` from baseline on first run.
 
-Run `start_servitor.bat` and the prompt-review menu appears before launch:
+### menu way (easy)
 
-| Key | Action |
+run `start_servitor.bat` and the menu pops before launch:
+
+| key | does what |
 |---|---|
-| `Enter` | Launch SERVITOR with the current `system_prompt.txt` |
-| `E` | Open `system_prompt.txt` in notepad — launcher waits until you close notepad, then returns to the menu |
-| `V` | Print the current loaded prompt to the console |
-| `R` | Restore the embedded baseline (factory reset of `system_prompt.txt`) |
-| `Q` | Abort launch |
+| Enter | launch with current prompt |
+| E | open `system_prompt.txt` in notepad. launcher waits till u close notepad, then back to menu |
+| V | print the loaded prompt to console |
+| R | restore embedded baseline (factory reset of `system_prompt.txt`) |
+| Q | abort, dont launch |
 
-Edits take effect on the **next launch** — there is no hot-reload. The launcher kills any running SERVITOR before relaunching, so changes propagate cleanly.
+edits take effect on **next launch** — no hot reload. launcher kills the old bot before relaunch so changes go in clean.
 
-### Via CLI
+### cli way
 
 ```bash
-python mrrobot.py --show-prompt     # print the prompt the bot WOULD use
+python mrrobot.py --show-prompt     # print the prompt the bot WOULD use right now
 python mrrobot.py --dump-baseline   # overwrite system_prompt.txt with the embedded baseline
 ```
 
-### Backups
+---
 
-Before extracting the prompt to a sidecar file, the original launcher and bot are preserved:
+## who can talk to it
 
-```
-mrrobot.py.bak_pre_extract
-start_servitor.bat.bak_pre_extract
-```
+a msg gets a reply when ALL of these are true:
 
-Delete those once you trust the new flow.
+1. author isnt the bot itself, isnt another bot (unless their name is in `ALLOW_BOT_USERNAMES`), isnt blacklisted
+2. AND ONE of these triggers fires:
+   - author `@`-mentioned the bot
+   - msg is a DM
+   - author's discord username (or display name) is in `WHITELIST_USERS`
+   - author has a role in `AUTHORISED_ROLES` AND the msg starts with a trigger word from `BOT_TRIGGER_NAMES`
+
+`BLACKLIST_USERS` always wins. blacklisted user `@`-mentions the bot? they get fuck all.
 
 ---
 
-## Authorisation logic
+## shutting it up mid-stream
 
-A message gets a reply when **all** of these are true:
+whitelisted users can kill an in-flight stream:
 
-1. Author is **not** the bot itself, **not** another bot, **not** on the blacklist.
-2. **One of** the following triggers fires:
-   - Author `@`-mentioned the bot.
-   - Message is a DM.
-   - Author's Discord username (or display name) is in `WHITELIST_USERS`.
-   - Author has a role listed in `AUTHORISED_ROLES` **and** the message starts with a trigger word from `BOT_TRIGGER_NAMES`.
-
-`BLACKLIST_USERS` always wins. Even if a blacklisted user `@`-mentions the bot, they get nothing.
-
----
-
-## Killswitch
-
-Whitelisted operators can cut a running stream at any time:
-
-| Phrase | Action |
+| phrase | does what |
 |---|---|
-| `stfu` | Cancel current stream — leaves a `[…cut off]` marker so you can see where it stopped |
-| `shut up` / `shutup` / `shut the fuck up` | Same as `stfu` |
-| `!stop` / `!kill` | Same as `stfu` |
-| `!skip` / `skip` / `next` | **Silent** cancel — deletes the in-flight message entirely. Use when you don't want the partial reply hanging in the channel |
+| `stfu` | cancel current stream. leaves a `[…cut off]` marker so u can see where it stopped |
+| `shut up` / `shutup` / `shut the fuck up` | same as stfu |
+| `!stop` / `!kill` | same as stfu |
+| `!skip` / `skip` / `next` | SILENT cancel — deletes the in-flight msg entirely. for when u dont want the half-baked reply hanging in chat |
 
-The bot reacts:
-- 🛑 — `stfu` triggered, partial reply marked as cut off
-- ⏭️ — `!skip` triggered, partial reply deleted
+bot reactions:
+
+- 🛑 — stfu fired, partial marked cut off
+- ⏭️ — !skip fired, partial deleted
 - 💤 — nothing was running, no-op
 
-**Auto-preempt:** if you send a new authorised message while a stream is still running in that channel, the old stream is cancelled and a new one starts. No need to manually `stfu` first.
+**auto-preempt:** send a new authorised msg while a stream is still running and the old one auto-cancels and the new one starts. dont need to stfu first.
 
 ---
 
-## Slash-style commands
+## slash-style commands
 
-Prefix is `!servitor ` (configurable in code).
+prefix is `!servitor ` (configurable in code).
 
-| Command | Who | What |
+| command | who | what |
 |---|---|---|
-| `!servitor status` | whitelist or authorised role | Print model name, Ollama URL, current channel memory depth, status line |
-| `!servitor forget` | whitelist or authorised role | Wipe rolling memory for the current channel |
+| `!servitor status` | whitelist or auth role | print model name, ollama url, channel memory depth |
+| `!servitor forget` | whitelist or auth role | wipe rolling memory for THIS channel only |
 
-Direct phrases that act like commands without the `!servitor ` prefix:
+direct phrases (no prefix needed):
 
-| Phrase | Who | What |
+| phrase | who | what |
 |---|---|---|
-| `stfu`, `shut up`, `!stop`, `!kill` | whitelist | Cancel in-flight stream (loud — leaves cut-off marker) |
-| `!skip`, `skip`, `next` | whitelist | Cancel in-flight stream (silent — deletes the partial message) |
+| `stfu`, `shut up`, `!stop`, `!kill` | whitelist | cancel in-flight stream (loud — leaves cut-off marker) |
+| `!skip`, `skip`, `next` | whitelist | cancel in-flight stream (silent — deletes partial) |
 
 ---
 
-## File attachments
+## file attachments
 
-If a **whitelisted** user attaches files when messaging the bot, each attachment is fetched, decoded, and dumped into the prompt raw. No size limits, no content filters.
+if a **whitelisted** user attaches files, each one gets fetched, decoded and dumped into the prompt raw. no size limits, no content filters.
 
-| Type | Behaviour |
+| type | what happens |
 |---|---|
-| `.txt .md .csv .json .log .py .js .ts .html .css .sql .yml .yaml .ini .cfg .sh .ps1 .bat .lsp .lisp .c .cpp .h .rs .go .rb .java .kt .swift .xml .toml .env` | Decoded as UTF-8 (fallbacks: utf-8-sig, latin-1) and inlined |
-| `.pdf` | Text layer extracted via `pdfplumber`. **Scanned/image-only PDFs return empty** — pdfplumber doesn't OCR |
-| Anything else | Best-effort UTF-8 decode; binaries return a `[UNSUPPORTED_BINARY]` marker |
+| `.txt .md .csv .json .log .py .js .ts .html .css .sql .yml .yaml .ini .cfg .sh .ps1 .bat .lsp .lisp .c .cpp .h .rs .go .rb .java .kt .swift .xml .toml .env` | decoded as utf-8 (fallbacks: utf-8-sig, latin-1) and inlined into the prompt |
+| `.pdf` | text layer extracted via `pdfplumber`. **scanned/image-only PDFs return empty** — pdfplumber doesnt OCR |
+| `.docx` | extracted via `python-docx` if its installed |
+| anything else | best-effort utf-8 decode. binaries return a `[UNSUPPORTED_BINARY]` marker |
 
-Non-whitelisted users get no attachment processing — their text content is read as normal but files are ignored.
+non-whitelisted users get NO attachment processing. their text reads as normal but files are ignored.
 
 ---
 
-## Trigger words
+## trigger words (for non-whitelist users)
 
-If a user has a role in `AUTHORISED_ROLES`, they can address the bot without `@` by starting their message with a trigger word followed by space, comma, or colon:
+if a user has a role in `AUTHORISED_ROLES`, they can address the bot without `@` by starting their msg with a trigger word followed by space, comma or colon:
 
 ```
 machine, sitrep
@@ -205,82 +188,84 @@ servitor: write me a port scanner
 spirit, what's MITRE T1021
 ```
 
-Default trigger words: `servitor, spirit, machine, omnissiah, omnisiah` (configurable via `BOT_TRIGGER_NAMES`).
+defaults: `robot, mrrobot, mr robot` (configurable via `BOT_TRIGGER_NAMES`).
 
-Whitelisted users don't need triggers — anything they type in a channel where the bot can read is treated as a request.
-
----
-
-## Streaming behaviour
-
-When generation starts, the bot posts `⌛ thinking…` then edits that message every ~0.9s with the running content + a `▌` cursor. When one message reaches ~1900 characters, it's finalised (cursor dropped) and a new message starts the continuation. Final edit clears the cursor.
-
-Edit cadence is throttled so Discord won't rate-limit you. If a Discord HTTP error occurs mid-stream, the edit is silently skipped — the next edit retries.
+whitelist users dont need triggers — anything they type in a channel where the bot can read is treated as a request.
 
 ---
 
-## Memory
+## streaming behaviour
 
-`HISTORY_DEPTH = 12` (default) means the last 12 user messages + 12 bot replies per channel are kept and replayed to the model on every call. Memory:
+when generation kicks off the bot posts `⌛ thinking…` then edits that msg every ~0.9s with the running content + a `▌` cursor. when one msg hits ~1900 chars it gets finalised (cursor dropped) and a new msg starts the continuation. final edit clears the cursor.
 
-- **Persists across messages** within the same channel.
-- **Is wiped on bot restart** (in-memory deque, not persisted to disk).
-- **Is per-channel** — DMs and channels each have their own history.
-- **Can be wiped manually** with `!servitor forget`.
-
-Channel memory bleed is real: if you switch topics rapidly the old context can contaminate new answers. Use `!servitor forget` between unrelated topics.
+edit cadence is throttled so discord doesnt rate-limit u. if a discord HTTP error happens mid-stream the edit is silently skipped — next edit retries. no crash, no cleanup needed.
 
 ---
 
-## Environment variables
+## memory
 
-See `.env.example` for the full template. Quick reference:
+`HISTORY_DEPTH = 12` (default) means last 12 user msgs + 12 bot replies per channel are kept and replayed to the model on every call. memory:
 
-| Var | Default | Purpose |
+- persists across msgs in the same channel
+- **wipes on bot restart** (in-memory deque, not on disk)
+- per-channel (DMs and channels each have their own)
+- can be wiped manually with `!servitor forget`
+
+channel memory bleed is real. switch topics rapidly and old context contaminates new answers. use `!servitor forget` between unrelated topics.
+
+---
+
+## env vars
+
+see `.env.example` for the full template. quick ref:
+
+| var | default | does |
 |---|---|---|
-| `DISCORD_BOT_TOKEN` | — | Required. Bot token from Developer Portal. |
-| `OLLAMA_URL` | `http://localhost:11434/api/chat` | Local Ollama chat endpoint |
-| `MODEL_NAME` | `huihui_ai/qwen2.5-coder-abliterate:7b` | Pulled Ollama model name |
-| `BOT_TRIGGER_NAMES` | `robot,mrrobot,mr robot` | CSV trigger words |
-| `AUTHORISED_ROLES` | (empty) | CSV server role names allowed via triggers |
-| `WHITELIST_USERS` | (empty) | CSV Discord usernames that bypass triggers |
-| `BLACKLIST_USERS` | (empty) | CSV Discord usernames the bot ignores entirely |
-| `HISTORY_DEPTH` | `12` | Rolling memory size per channel |
-| `REQUEST_TIMEOUT` | `600` | Ollama HTTP timeout (seconds) |
+| `DISCORD_BOT_TOKEN` | — | required. bot token from dev portal |
+| `OLLAMA_URL` | `http://localhost:11434/api/chat` | local ollama chat endpoint |
+| `MODEL_NAME` | `huihui_ai/qwen2.5-coder-abliterate:7b` | pulled ollama model name |
+| `VISION_MODEL_NAME` | `huihui_ai/qwen2.5-vl-abliterated:7b` | model for image attachments |
+| `BOT_TRIGGER_NAMES` | `robot,mrrobot,mr robot` | csv trigger words for role-gated invocation |
+| `AUTHORISED_ROLES` | (empty) | csv server role names allowed via triggers |
+| `WHITELIST_USERS` | (empty) | csv discord usernames that bypass triggers |
+| `ALLOW_BOT_USERNAMES` | (empty) | csv bot usernames the bot WILL respond to (for webhook testing) |
+| `BLACKLIST_USERS` | (empty) | csv discord usernames the bot ignores entirely |
+| `HISTORY_DEPTH` | `12` | rolling memory size per channel |
+| `REQUEST_TIMEOUT` | `120` | ollama HTTP timeout (seconds) |
 
 ---
 
-## Voice/PyNaCl warnings
+## warnings to ignore
 
-On startup you'll see:
+on startup ull see:
 
 ```
 [WARNING] PyNaCl is not installed, voice will NOT be supported
 [WARNING] davey is not installed, voice will NOT be supported
 ```
 
-Ignore them. The bot doesn't use voice.
+ignore them. bot doesnt do voice.
 
 ---
 
-## File layout
+## file layout
 
 ```
 mrrobot/
-  mrrobot.py            # the bot (contains SYSTEM_PROMPT_BASELINE fallback)
-  system_prompt.txt     # live editable prompt — loaded at startup
-  start_servitor.bat    # launcher: prompt menu + Ollama warm-up + bot start
-  stop_servitor.bat     # kill SERVITOR python process
+  mrrobot.py            # the bot. has SYSTEM_PROMPT_BASELINE fallback baked in
+  system_prompt.txt     # live editable prompt — gitignored, private to ur rig
+  start_servitor.bat    # launcher: prompt menu + ollama warmup + bot start
+  stop_servitor.bat     # kills SERVITOR python process
   requirements.txt
   .env.example          # template
-  .env                  # your real config — gitignored
+  .env                  # ur real config — gitignored
   .gitignore
-  README.md
+  README.md             # this thing
   venv/                 # gitignored
 ```
 
 ---
 
-## License
+## license
 
-Private. No contribution accepted.
+private. dont fork. no contributions. mine.
