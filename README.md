@@ -180,6 +180,35 @@ env vars:
 
 ---
 
+## !argue — argument analyser
+
+paste a discord conversation into the bot, get back deployable counter-arguments in ur voice via the anthropic api. for when ur in a fight in another channel and cant be fked typing. operator-only.
+
+how to use:
+```
+!argue <paste the convo right after the command>
+```
+
+or reply to a message with just `!argue` and the bot will pull that message's content as the convo.
+
+what u get back:
+- **QUICK READ** — 2 sentences on who's winning + the opponent's pattern
+- **CODE BLOCKS** — 3-5 deployable counters, each ready to copy-paste raw into discord
+- **RECOMMENDATION** — which to fire first, what to reserve, when to walk
+- **CLOSE** — one cold-exit line for walking away on top
+
+uses claude-haiku-4-5 by default (~$0.005 per analysis). about 8-12 sec response time.
+
+requires `ANTHROPIC_API_KEY` in `.env`. lives in `argue.py` — system prompt for the analyst is there if u want to tune the voice.
+
+env vars:
+| var | default | does |
+|---|---|---|
+| `ARGUE_MODEL` | `claude-haiku-4-5` | model for argument analysis (sonnet for harder cases) |
+| `ARGUE_MAX_TOKENS` | `2048` | max output length |
+
+---
+
 ## who can talk to it
 
 a msg gets a reply when ALL of these are true:
@@ -330,6 +359,7 @@ ignore them. bot doesnt do voice.
 mrrobot/
   mrrobot.py            # the bot. has SYSTEM_PROMPT_BASELINE fallback baked in
   web_search.py         # duckduckgo wrapper for the [WEBSEARCH] sentinel
+  argue.py              # !argue command — argument analyser via anthropic api
   system_prompt.txt     # live editable prompt — gitignored, private to ur rig
   start_servitor.bat    # launcher: prompt menu + ollama warmup + bot start
   stop_servitor.bat     # kills SERVITOR python process

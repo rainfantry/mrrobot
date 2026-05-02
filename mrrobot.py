@@ -42,6 +42,11 @@ try:
 except ImportError:
     AsyncAnthropic = None
 
+try:
+    from argue import analyse as argue_analyse
+except ImportError:
+    argue_analyse = None
+
 load_dotenv(override=True)  # .env wins over pre-existing shell env vars
 
 BOT_TOKEN          = os.getenv("DISCORD_BOT_TOKEN")
@@ -253,6 +258,7 @@ skip_streams = set()  # channel_ids whose current cancel was a !skip (delete vs 
 
 STOP_PHRASES = ("stfu", "shut up", "shutup", "shut the fuck up", "!stop", "!kill")
 SKIP_PHRASES = ("!skip", "skip", "next")
+ARGUE_PHRASES = ("!argue", "/argue")
 
 # Sentinel: matches "[WEBSEARCH]: <query>" terminated by newline OR [STOPPED.
 # Mid-stream: requires a terminator so we don't fire on partial query tokens.
@@ -296,6 +302,15 @@ def is_stop_command(content):
 
 def is_skip_command(content):
     return _matches(content, SKIP_PHRASES)
+
+
+def is_argue_command(content):
+    """!argue <pasted convo>  or  !argue (when replying to another msg)."""
+    c = content.lstrip().lower()
+    for p in ARGUE_PHRASES:
+        if c == p or c.startswith(p + " ") or c.startswith(p + "\n"):
+            return True
+    return False
 
 
 def is_whitelisted(author):
@@ -645,6 +660,44 @@ async def on_message(message):
                 pass
         return
 
+    # ARGUE handler: paste a convo, get back deployable counter-arguments via Anthropic.
+    # Routes to a SEPARATE system prompt (argue.py) — different mind from SERVITOR proper.
+    if is_whitelisted(message.author) and is_argue_command(message.content):
+        if argue_analyse is None:
+            await message.channel.send("*[!argue: argue.py module not loaded]*")
+            return
+        if not ANTHROPIC_API_KEY:
+            await message.channel.send("*[!argue: ANTHROPIC_API_KEY not set in .env]*")
+            return
+        # Strip the prefix; everything after is the convo body
+        body = re.sub(r"^[!/]argue\s*", "", message.content, flags=re.IGNORECASE).strip()
+        # If body is empty and the operator replied to another msg, use that
+        if not body and message.reference:
+            try:
+                ref = await message.channel.fetch_message(message.reference.message_id)
+                body = ref.content
+            except Exception as exc:
+                log.warning(f"[ARGUE] failed to fetch referenced msg: {exc}")
+        if not body:
+            await message.channel.send(
+                "*[usage: `!argue <paste convo>` or reply to a msg with `!argue`]*"
+            )
+            return
+        log.info(f"[ARGUE] {message.author.name} requesting analysis ({len(body)} chars)")
+        placeholder = await message.channel.send("🎯 *analysing argument…*")
+        try:
+            result = await argue_analyse(body, ANTHROPIC_API_KEY)
+            chunks = chunk_reply(result, limit=1900)
+            await placeholder.edit(content=chunks[0])
+            for chunk in chunks[1:]:
+                await message.channel.send(chunk)
+            log.info(f"[ARGUE] analysis returned {len(result)} chars in {len(chunks)} chunk(s)")
+        except Exception as exc:
+            detail = str(exc)[:200] or type(exc).__name__
+            await placeholder.edit(content=f"*[!argue failed: {detail}]*"[:1990])
+            log.exception("[ARGUE] analysis failed")
+        return
+
     # AUTH handler: list whitelisted operators (whitelist-only, no LLM)
     if is_whitelisted(message.author) and _matches(message.content, AUTH_PHRASES):
         log.info(f"AUTH query by {message.author.name}")
@@ -688,6 +741,10 @@ async def on_message(message):
             "\n"
             "shortcuts / list shortcuts / !shortcuts / !help\n"
             "    -> show this list\n"
+            "\n"
+            "!argue <paste convo>  OR  reply to a msg with !argue\n"
+            "    -> analyse a discord argument, return deployable counter-args\n"
+            "    -> via anthropic API. requires ANTHROPIC_API_KEY in .env\n"
             "```"
         )
         await message.channel.send(text)
