@@ -26,12 +26,22 @@ Thumbs.db
 
 # Test/diagnostic scripts (kept local, not part of release)
 test_ollama.py
+test_servitor_prompt.py
 webhook_test.py
 webhook_full_test.py
 capability_test.py
 prompt_test.py
 webhook_persona_test.py
 docx_test.py
+docx_test_output.txt
 
-# Runtime log
+# Runtime logs
 bot.log
+bot.stdout.log
+
+# Live editable system prompt — private to each operator's rig.
+# Bot reads it at startup with a fallback to SYSTEM_PROMPT_BASELINE in mrrobot.py.
+system_prompt.txt
+
+# Pre-extraction backups (safe to delete once the new layout is trusted)
+*.bak_pre_extract

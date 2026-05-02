@@ -1,12 +1,80 @@
 @echo off
 title SERVITOR Launcher
+chcp 65001 >nul
+cd /d "%~dp0"
 
 echo.
+echo ============================================
 echo === SERVITOR LAUNCHER ===
+echo ============================================
+
+REM ---- BOOTSTRAP: ensure system_prompt.txt exists ----
+if not exist "%~dp0system_prompt.txt" (
+    echo.
+    echo [BOOTSTRAP] system_prompt.txt missing - dumping embedded baseline...
+    .\venv\Scripts\python.exe mrrobot.py --dump-baseline
+)
+
+REM ---- PRE-FLIGHT: PROMPT REVIEW MENU ----
+:prompt_menu
 echo.
+echo --------------------------------------------
+echo --- SYSTEM PROMPT REVIEW ---
+echo --------------------------------------------
+echo   [Enter] launch SERVITOR with current prompt
+echo   [E]     edit prompt in notepad (launcher waits)
+echo   [V]     view current prompt
+echo   [R]     restore embedded baseline (factory reset)
+echo   [Q]     quit launcher
+echo.
+set "CHOICE="
+set /p "CHOICE=Choice: "
+
+if /i "%CHOICE%"=="E" (
+    echo Opening notepad - close it when done editing.
+    notepad "%~dp0system_prompt.txt"
+    echo Editor closed. Returning to menu.
+    goto prompt_menu
+)
+if /i "%CHOICE%"=="V" (
+    echo.
+    echo --- BEGIN PROMPT ---
+    .\venv\Scripts\python.exe mrrobot.py --show-prompt
+    echo --- END PROMPT ---
+    echo.
+    pause
+    goto prompt_menu
+)
+if /i "%CHOICE%"=="R" (
+    echo.
+    echo [RESTORE] Overwriting system_prompt.txt with embedded baseline...
+    .\venv\Scripts\python.exe mrrobot.py --dump-baseline
+    goto prompt_menu
+)
+if /i "%CHOICE%"=="Q" (
+    echo Aborted by operator.
+    timeout /t 2 /nobreak >NUL
+    exit /b 0
+)
+REM Empty input or Enter -> proceed to launch
+
+echo.
+echo --------------------------------------------
+echo --- LAUNCH SEQUENCE ---
+echo --------------------------------------------
+
+REM ---- Step 0: Kill any existing SERVITOR python processes ----
+echo.
+echo [0/4] Killing any existing SERVITOR processes...
+for /f "tokens=2 delims==," %%P in ('wmic process where "name='python.exe' and commandline like '%%mrrobot.py%%'" get processid /format:csv 2^>nul ^| findstr /R "[0-9]"') do (
+    echo   Killing PID %%P
+    taskkill /F /PID %%P >NUL 2>&1
+)
+echo   Pre-flight clean.
 
 REM ---- Step 1: Ollama service ----
-echo [1/3] Checking Ollama...
+echo.
+echo [1/4] Checking Ollama...
 tasklist /FI "IMAGENAME eq ollama.exe" 2>NUL | find /I "ollama.exe" >NUL
 if errorlevel 1 (
     echo   Ollama not running, starting minimised window...
@@ -25,17 +93,26 @@ if errorlevel 1 (
 )
 echo   Ollama is up.
 
-REM ---- Step 2: Preload model with permanent keep-alive ----
+REM ---- Step 2: Preload coder model with permanent keep-alive ----
 echo.
-echo [2/3] Preloading model into RAM (cold start can take 30-60s)...
+echo [2/4] Preloading coder model into RAM (cold start can take 30-60s)...
 curl -s -X POST http://localhost:11434/api/generate -H "Content-Type: application/json" -d "{\"model\":\"huihui_ai/qwen2.5-coder-abliterate:7b\",\"keep_alive\":-1,\"options\":{\"num_ctx\":4096}}"
 echo.
-echo   Model warm.
+echo   Coder model warm.
 
-REM ---- Step 3: Launch the bot ----
+REM ---- Step 3: Preload vision model (skipped silently if not yet pulled) ----
 echo.
-echo [3/3] Launching SERVITOR bot in new window...
-cd /d "%~dp0"
+echo [3/4] Preloading vision model...
+curl -s -X POST http://localhost:11434/api/generate -H "Content-Type: application/json" -d "{\"model\":\"huihui_ai/qwen2.5-vl-abliterated:7b\",\"keep_alive\":-1,\"options\":{\"num_ctx\":4096}}" >NUL 2>&1
+if errorlevel 1 (
+    echo   Vision model not pulled yet - vision queries will cold-load on first use.
+) else (
+    echo   Vision model warm.
+)
+
+REM ---- Step 4: Launch the bot ----
+echo.
+echo [4/4] Launching SERVITOR bot in new window...
 start "SERVITOR" cmd /k ".\venv\Scripts\python.exe mrrobot.py"
 
 echo.

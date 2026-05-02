@@ -6,6 +6,20 @@ Built around an abliterated coder model (`huihui_ai/qwen2.5-coder-abliterate:7b`
 
 ---
 
+## Requirements
+
+| Requirement | Status | Purpose |
+|---|---|---|
+| **Discord bot token** | REQUIRED | Auth for the Discord gateway. Without it the bot exits at startup with `DISCORD_BOT_TOKEN not set`. Get one at https://discord.com/developers/applications |
+| **Ollama running locally** | REQUIRED | Hosts the LLM. Default endpoint `http://localhost:11434`. Install from https://ollama.com |
+| **An Ollama model pulled** | REQUIRED | The bot calls whatever `MODEL_NAME` points to. Default `huihui_ai/qwen2.5-coder-abliterate:7b`. Pull with `ollama pull <model>` |
+| **Vision model (optional)** | OPTIONAL | If users attach images, the bot routes them to `VISION_MODEL_NAME` (default `huihui_ai/qwen2.5-vl-abliterated:7b`). Skip if you don't need image input — image attachments will just fail silently. |
+| **Anthropic API key** | OPTIONAL — future | The Oracle Bridge in the system prompt is currently MANUAL: the bot prints a query, the operator pastes the answer back. If you want to automate that bridge — calling Claude via the Anthropic SDK to fetch live data — you would need an `ANTHROPIC_API_KEY` set in `.env`. **Not implemented yet** — the prompt's bridge protocol assumes a human relay. Set this only if you build the auto-relay yourself. |
+| **Python 3.10+** | REQUIRED | Discord.py + asyncio + typing |
+| **OS** | Linux / macOS / Windows | Tested on Windows 11. The included `start_servitor.bat` is Windows-only; on Linux/macOS just `python mrrobot.py` after `ollama serve`. |
+
+---
+
 ## Features
 
 - **100% offline.** All inference happens locally via Ollama.
@@ -57,11 +71,60 @@ cp .env.example .env
 
 ### 5. Run
 
+**Recommended (Windows):** double-click `start_servitor.bat`. It will:
+
+1. Bootstrap `system_prompt.txt` from the embedded baseline if missing.
+2. Show a prompt-review menu (edit / view / restore / launch).
+3. Kill any stale SERVITOR processes.
+4. Start Ollama if it isn't running and wait for port 11434.
+5. Preload the coder + vision models with permanent keep-alive.
+6. Launch the bot in its own window.
+
+**Manual:**
+
 ```bash
 python mrrobot.py
 ```
 
 Make sure Ollama is running first (`ollama serve` if it isn't already).
+
+---
+
+## Editing the system prompt
+
+The full system prompt lives in **`system_prompt.txt`** next to `mrrobot.py`. The bot reads it at startup. If the file is missing or empty it falls back to the embedded `SYSTEM_PROMPT_BASELINE` constant in `mrrobot.py` — the file can never brick the bot.
+
+### Via the launcher (easy)
+
+Run `start_servitor.bat` and the prompt-review menu appears before launch:
+
+| Key | Action |
+|---|---|
+| `Enter` | Launch SERVITOR with the current `system_prompt.txt` |
+| `E` | Open `system_prompt.txt` in notepad — launcher waits until you close notepad, then returns to the menu |
+| `V` | Print the current loaded prompt to the console |
+| `R` | Restore the embedded baseline (factory reset of `system_prompt.txt`) |
+| `Q` | Abort launch |
+
+Edits take effect on the **next launch** — there is no hot-reload. The launcher kills any running SERVITOR before relaunching, so changes propagate cleanly.
+
+### Via CLI
+
+```bash
+python mrrobot.py --show-prompt     # print the prompt the bot WOULD use
+python mrrobot.py --dump-baseline   # overwrite system_prompt.txt with the embedded baseline
+```
+
+### Backups
+
+Before extracting the prompt to a sidecar file, the original launcher and bot are preserved:
+
+```
+mrrobot.py.bak_pre_extract
+start_servitor.bat.bak_pre_extract
+```
+
+Delete those once you trust the new flow.
 
 ---
 
@@ -204,13 +267,16 @@ Ignore them. The bot doesn't use voice.
 
 ```
 mrrobot/
-  mrrobot.py        # the bot
+  mrrobot.py            # the bot (contains SYSTEM_PROMPT_BASELINE fallback)
+  system_prompt.txt     # live editable prompt — loaded at startup
+  start_servitor.bat    # launcher: prompt menu + Ollama warm-up + bot start
+  stop_servitor.bat     # kill SERVITOR python process
   requirements.txt
-  .env.example      # template
-  .env              # your real config — gitignored
+  .env.example          # template
+  .env                  # your real config — gitignored
   .gitignore
   README.md
-  venv/             # gitignored
+  venv/                 # gitignored
 ```
 
 ---
