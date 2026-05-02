@@ -31,7 +31,18 @@ try:
 except ImportError:
     docxlib = None
 
-load_dotenv()
+try:
+    from web_search import search as ws_search, format_for_prompt as ws_format
+except ImportError:
+    ws_search = None
+    ws_format = None
+
+try:
+    from anthropic import AsyncAnthropic
+except ImportError:
+    AsyncAnthropic = None
+
+load_dotenv(override=True)  # .env wins over pre-existing shell env vars
 
 BOT_TOKEN          = os.getenv("DISCORD_BOT_TOKEN")
 OLLAMA_URL         = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
@@ -45,6 +56,20 @@ ALLOW_BOT_USERS    = [u.strip().lower() for u in os.getenv("ALLOW_BOT_USERNAMES"
 HISTORY_DEPTH      = int(os.getenv("HISTORY_DEPTH", "12"))
 REQUEST_TIMEOUT    = int(os.getenv("REQUEST_TIMEOUT", "120"))
 MAX_REPLY_CHARS    = 1900
+
+# Websearch tool (DuckDuckGo via ddgs lib). When the model emits
+# [WEBSEARCH]: <query>\n[STOPPED — awaiting search results]
+# we intercept, run the search, inject results, and re-prompt.
+SEARCH_ENABLED     = os.getenv("SEARCH_ENABLED", "true").lower() in ("true", "1", "yes")
+SEARCH_MAX_LOOPS   = int(os.getenv("SEARCH_MAX_LOOPS", "3"))
+SEARCH_MAX_RESULTS = int(os.getenv("SEARCH_MAX_RESULTS", "5"))
+
+# Anthropic vision bridge. When VISION_MODEL_NAME starts with "anthropic:",
+# image-bearing requests route to the Anthropic API instead of local Ollama.
+# Format: VISION_MODEL_NAME=anthropic:claude-haiku-4-5
+# Requires ANTHROPIC_API_KEY in .env.
+ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MAX_TOK  = int(os.getenv("ANTHROPIC_MAX_TOKENS", "1024"))
 
 _LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
 logging.basicConfig(
@@ -228,6 +253,20 @@ skip_streams = set()  # channel_ids whose current cancel was a !skip (delete vs 
 
 STOP_PHRASES = ("stfu", "shut up", "shutup", "shut the fuck up", "!stop", "!kill")
 SKIP_PHRASES = ("!skip", "skip", "next")
+
+# Sentinel: matches "[WEBSEARCH]: <query>" terminated by newline OR [STOPPED.
+# Mid-stream: requires a terminator so we don't fire on partial query tokens.
+# End-of-stream: a separate "naked" match (no terminator) handles models that
+# emit the sentinel and stop without a newline (qwen-coder-abliterate does this).
+WEBSEARCH_RE = re.compile(
+    r"\[WEBSEARCH\]:\s*([^\n\r]+?)\s*(?:[\n\r]|\[STOPPED)",
+    re.IGNORECASE,
+)
+# End-of-stream fallback: same pattern but allows query to end the string.
+WEBSEARCH_NAKED_RE = re.compile(
+    r"\[WEBSEARCH\]:\s*([^\n\r]+)\s*\Z",
+    re.IGNORECASE,
+)
 AUTH_PHRASES = (
     "who has auth", "whos got auth", "who's got auth", "who got auth",
     "whitelist", "show whitelist", "list whitelist",
@@ -445,6 +484,94 @@ async def stream_ollama(messages):
                     break
 
 
+_anthropic_client = None
+
+
+def _get_anthropic_client():
+    """Lazy-init the AsyncAnthropic client. None if SDK missing or key unset."""
+    global _anthropic_client
+    if _anthropic_client is None:
+        if AsyncAnthropic is None or not ANTHROPIC_API_KEY:
+            return None
+        _anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    return _anthropic_client
+
+
+def _guess_image_media_type(b64_data: str) -> str:
+    """Sniff image format from the first few decoded bytes. Defaults to image/jpeg."""
+    try:
+        head = base64.b64decode(b64_data[:32])
+    except Exception:
+        return "image/jpeg"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith(b"\x89PNG\r\n"):
+        return "image/png"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
+async def stream_anthropic_vision(messages):
+    """Stream vision response from Anthropic API. Used when VISION_MODEL_NAME
+    starts with 'anthropic:' AND the request carries images. Sends only the
+    most recent user turn + its images + the SERVITOR system prompt — no
+    rolling history (vision queries are typically self-contained)."""
+    client = _get_anthropic_client()
+    if client is None:
+        raise RuntimeError("ANTHROPIC_API_KEY not set or anthropic SDK missing")
+
+    model = VISION_MODEL_NAME.split(":", 1)[1] if ":" in VISION_MODEL_NAME else VISION_MODEL_NAME
+    log.info(f"Anthropic vision -> {model}")
+
+    last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    if last_user is None:
+        raise RuntimeError("no user message in history for anthropic vision")
+
+    text = last_user.get("content", "") or ""
+    images = last_user.get("images", []) or []
+
+    content_blocks = []
+    for img_b64 in images:
+        content_blocks.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": _guess_image_media_type(img_b64),
+                "data": img_b64,
+            },
+        })
+    if text:
+        content_blocks.append({"type": "text", "text": text})
+
+    async with client.messages.stream(
+        model=model,
+        max_tokens=ANTHROPIC_MAX_TOK,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": content_blocks}],
+    ) as stream:
+        async for delta in stream.text_stream:
+            if delta:
+                yield delta
+
+
+def _select_stream(messages):
+    """Route to Anthropic vision when configured AND request has images,
+    otherwise default to local Ollama. Returns an async generator either way."""
+    has_img = _has_images(messages)
+    use_anthropic = (
+        has_img
+        and VISION_MODEL_NAME.lower().startswith("anthropic:")
+        and ANTHROPIC_API_KEY
+        and AsyncAnthropic is not None
+    )
+    if use_anthropic:
+        return stream_anthropic_vision(messages)
+    return stream_ollama(messages)
+
+
 def chunk_reply(text, limit=MAX_REPLY_CHARS):
     if len(text) <= limit:
         return [text]
@@ -630,47 +757,98 @@ async def on_message(message):
 
     async def _run_stream():
         sent_msg = await message.channel.send("⌛ *thinking…*")
-        full_reply = ""
-        current_chunk = ""
-        last_edit = 0.0
-        EDIT_INTERVAL = 0.9
-        SOFT_LIMIT = 1900
+        full_reply = ""        # last iteration's full text (the canonical reply)
+        current_chunk = ""     # text in the current Discord msg slot
         cancelled = False
+        timed_out_or_failed = False
+        search_loops = 0       # WEBSEARCH sentinel intercepts so far
 
         try:
-            async for tok in stream_ollama(history):
-                full_reply += tok
-                current_chunk += tok
+            # Outer loop: each iteration = one ollama call. Sentinel hits trigger
+            # search + re-prompt + another iteration. Normal completion breaks out.
+            while True:
+                full_reply = ""
+                current_chunk = ""
+                last_edit = 0.0
+                EDIT_INTERVAL = 0.9
+                SOFT_LIMIT = 1900
+                sentinel_query = None
 
-                if len(current_chunk) >= SOFT_LIMIT:
-                    split_at = max(
-                        current_chunk.rfind("\n\n", 0, SOFT_LIMIT),
-                        current_chunk.rfind("\n", 0, SOFT_LIMIT),
-                        current_chunk.rfind(". ", 0, SOFT_LIMIT),
-                    )
-                    if split_at < SOFT_LIMIT // 2:
-                        split_at = SOFT_LIMIT
-                    head, tail = current_chunk[:split_at], current_chunk[split_at:]
-                    await sent_msg.edit(content=head)
-                    sent_msg = await message.channel.send(tail + " ▌" if tail else "▌")
-                    current_chunk = tail
-                    last_edit = time.monotonic()
-                    continue
+                async for tok in _select_stream(history):
+                    full_reply += tok
+                    current_chunk += tok
 
-                now = time.monotonic()
-                if now - last_edit >= EDIT_INTERVAL:
+                    # WEBSEARCH sentinel: detect [WEBSEARCH]: <q>\n...[STOPPED
+                    # Only intercept if enabled, lib loaded, and budget remaining.
+                    if (SEARCH_ENABLED and ws_search is not None
+                            and search_loops < SEARCH_MAX_LOOPS):
+                        m = WEBSEARCH_RE.search(full_reply)
+                        if m:
+                            sentinel_query = m.group(1).strip()
+                            break  # exit token loop, handle sentinel below
+
+                    # SOFT_LIMIT split (split long replies across multiple Discord msgs)
+                    if len(current_chunk) >= SOFT_LIMIT:
+                        split_at = max(
+                            current_chunk.rfind("\n\n", 0, SOFT_LIMIT),
+                            current_chunk.rfind("\n", 0, SOFT_LIMIT),
+                            current_chunk.rfind(". ", 0, SOFT_LIMIT),
+                        )
+                        if split_at < SOFT_LIMIT // 2:
+                            split_at = SOFT_LIMIT
+                        head, tail = current_chunk[:split_at], current_chunk[split_at:]
+                        await sent_msg.edit(content=head)
+                        sent_msg = await message.channel.send(tail + " ▌" if tail else "▌")
+                        current_chunk = tail
+                        last_edit = time.monotonic()
+                        continue
+
+                    # Periodic edit (cursor visual)
+                    now = time.monotonic()
+                    if now - last_edit >= EDIT_INTERVAL:
+                        try:
+                            await sent_msg.edit(content=current_chunk + " ▌")
+                            last_edit = now
+                        except discord.HTTPException:
+                            pass
+
+                # === inner for-loop ended ===
+
+                # Naked-sentinel fallback: model emitted [WEBSEARCH]: <q> and
+                # just stopped without newline or [STOPPED]. Catch it here.
+                if (sentinel_query is None and SEARCH_ENABLED and ws_search is not None
+                        and search_loops < SEARCH_MAX_LOOPS):
+                    m_naked = WEBSEARCH_NAKED_RE.search(full_reply.rstrip())
+                    if m_naked:
+                        sentinel_query = m_naked.group(1).strip()
+
+                if sentinel_query:
+                    # WEBSEARCH path: announce, run search, re-prompt
+                    search_loops += 1
+                    log.info(f"[SEARCH] sentinel ({search_loops}/{SEARCH_MAX_LOOPS}): {sentinel_query!r}")
                     try:
-                        await sent_msg.edit(content=current_chunk + " ▌")
-                        last_edit = now
+                        await sent_msg.edit(content=f"🔍 searching: `{sentinel_query}`")
                     except discord.HTTPException:
                         pass
+                    results = await asyncio.to_thread(
+                        ws_search, sentinel_query, SEARCH_MAX_RESULTS
+                    )
+                    search_block = ws_format(sentinel_query, results)
+                    # Append the assistant's sentinel emission + the result block
+                    # so the model sees its own action and the data on next call.
+                    history.append({"role": "assistant", "content": full_reply})
+                    history.append({"role": "system", "content": search_block})
+                    # Fresh placeholder, loop again
+                    sent_msg = await message.channel.send("⌛ *thinking…*")
+                    continue
 
-            if current_chunk.strip():
-                await sent_msg.edit(content=current_chunk)
-            else:
-                await sent_msg.edit(content="*[machine-spirit returned nothing]*")
-
-            log.info(f"Ollama streamed ({len(full_reply)} chars)")
+                # === normal completion (no sentinel this iteration) ===
+                if current_chunk.strip():
+                    await sent_msg.edit(content=current_chunk)
+                else:
+                    await sent_msg.edit(content="*[machine-spirit returned nothing]*")
+                log.info(f"Ollama streamed ({len(full_reply)} chars, searches={search_loops})")
+                break
 
         except asyncio.CancelledError:
             cancelled = True
@@ -690,16 +868,17 @@ async def on_message(message):
         except asyncio.TimeoutError:
             await sent_msg.edit(content="*[timeout - Ollama took too long, check the rig]*")
             log.error("Ollama timeout")
-            full_reply = ""
+            timed_out_or_failed = True
         except Exception as e:
             detail = str(e)[:300] or type(e).__name__
             if "more system memory" in detail or "out of memory" in detail.lower():
                 detail = "Ollama out of RAM — close some apps and try again"
             await sent_msg.edit(content=f"*[machine-spirit fault: {detail}]*"[:1990])
             log.exception("Ollama stream failed")
-            full_reply = ""
+            timed_out_or_failed = True
 
-        if full_reply and not cancelled:
+        # Memory: only store the final clean answer (no sentinel emissions).
+        if full_reply and not cancelled and not timed_out_or_failed:
             channel_memory[chan_id].append({"role": "assistant", "content": full_reply})
         elif full_reply and cancelled:
             channel_memory[chan_id].append(

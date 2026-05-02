@@ -1,8 +1,14 @@
 # SERVITOR
 
-local discord bot. talks to ollama on ur own rig. no cloud, no telemetry, no openai, no anthropic. once u pull the model and start the bot, every msg stays on ur machine.
+local discord bot. talks to ollama on ur own rig. by default no cloud, no telemetry, no third-party calls — every msg stays on ur machine.
 
 defaults to `huihui_ai/qwen2.5-coder-abliterate:7b` — abliterated coder model. says what u ask, no "as an AI" hedge.
+
+**two optional cloud tools** u can wire in if u want them:
+- **websearch** via duckduckgo (free, no key, automatic)
+- **vision** via anthropic api (~$0.002 per image, only fires when an image is attached AND u opt in)
+
+both are off-by-default for vision, on-by-default for websearch. text + memory always stay local.
 
 ---
 
@@ -13,8 +19,8 @@ defaults to `huihui_ai/qwen2.5-coder-abliterate:7b` — abliterated coder model.
 | discord bot token | yes | bot cant connect to discord without it. grab one at https://discord.com/developers/applications |
 | ollama running | yes | hosts the LLM on `localhost:11434`. install from https://ollama.com |
 | a model pulled | yes | bot calls whatever `MODEL_NAME` is set to. default is the qwen coder abliterate above. `ollama pull <model>` to grab one |
-| vision model | optional | if u want it to look at images. default `huihui_ai/qwen2.5-vl-abliterated:7b`. skip it and image attachments just fail silently — bot keeps working |
-| anthropic api key | optional, future | the bot's system prompt has an "Oracle Bridge" — when it doesnt know something post-training-cutoff, it prints a query and waits for u to paste back a real answer. currently MANUAL. if u ever automate the bridge ull need an `ANTHROPIC_API_KEY` in `.env`. not implemented yet, just leaving the door open |
+| vision model (local) | optional | a vision-capable ollama model for image attachments. e.g. `huihui_ai/qwen2.5-vl-abliterated:7b` or `qwen2.5vl:3b`. skip and image attachments fail silently — bot keeps working on text |
+| anthropic api key | optional | EITHER for cloud vision (set `VISION_MODEL_NAME=anthropic:claude-haiku-4-5` and put `ANTHROPIC_API_KEY` in `.env`). way faster than local on weak GPUs, ~$0.002 per image. text never leaves ur rig — only image queries do |
 | python 3.10+ | yes | discord.py + asyncio |
 | os | win/linux/mac | tested on win11. `start_servitor.bat` is windows-only. on linux/mac just run `python mrrobot.py` after `ollama serve` |
 
@@ -73,8 +79,14 @@ edit `.env`. paste the bot token. put ur discord username (lowercase) in `WHITEL
 **manual / linux / mac:**
 
 ```bash
+# ALWAYS activate the venv first or shit WONT WORK (deps live in venv, not system python)
+venv\Scripts\activate          # windows
+# source venv/bin/activate     # linux/mac
+
 python mrrobot.py
 ```
+
+`start_servitor.bat` already calls the venv python directly (`venv\Scripts\python.exe mrrobot.py`) so u dont need to activate when using the .bat. only matters when running by hand.
 
 make sure ollama is running first — `ollama serve` if it isnt.
 
@@ -106,6 +118,65 @@ edits take effect on **next launch** — no hot reload. launcher kills the old b
 python mrrobot.py --show-prompt     # print the prompt the bot WOULD use right now
 python mrrobot.py --dump-baseline   # overwrite system_prompt.txt with the embedded baseline
 ```
+
+---
+
+## websearch (tool)
+
+bot can search the web mid-reply when it doesnt know something. how it works:
+
+1. SERVITOR generates `[WEBSEARCH]: <query>` and stops
+2. mrrobot.py intercepts that line, runs duckduckgo via the `ddgs` lib
+3. top 5 organic results (ads filtered) get injected back as context
+4. bot re-prompts itself, answers with citations
+
+u see `🔍 searching: <query>` flash up in the channel before the answer arrives.
+
+config (env vars):
+| var | default | does |
+|---|---|---|
+| `SEARCH_ENABLED` | `true` | master switch. set `false` to disable sentinel interception entirely |
+| `SEARCH_MAX_LOOPS` | `3` | max searches per single user msg (cap on chained queries) |
+| `SEARCH_MAX_RESULTS` | `5` | results returned per search after ad filter |
+
+ad-blocking patterns: drops `bing.com/aclick`, `googleadservices`, `doubleclick`, etc. so the model doesnt cite sponsored garbage as fact.
+
+requires `pip install ddgs`. already in `requirements.txt`.
+
+---
+
+## vision
+
+two paths. pick whichever fits ur rig.
+
+### local vision (ollama)
+
+set `VISION_MODEL_NAME=<model>` to any vision-capable ollama model. when an image is attached, the bot auto-routes that request through the vision model instead of the coder.
+
+works on beefy GPUs. on a 4GB GPU u'll likely OOM into CPU and timeouts — vision compute graphs are huge even for 3B models.
+
+### cloud vision (anthropic)
+
+set `VISION_MODEL_NAME=anthropic:claude-haiku-4-5` (or `anthropic:claude-sonnet-4-6`) and put `ANTHROPIC_API_KEY=sk-ant-...` in `.env`. now image queries route to the anthropic api instead of ollama.
+
+| | local | anthropic |
+|---|---|---|
+| works on 4GB GPU? | ❌ no | ✓ yes |
+| latency | 30-90s on a 5090, ∞ on a laptop | 2-5 sec |
+| quality | mediocre on small models | best-in-class |
+| cost | $0 | ~$0.001-0.005 per image |
+| privacy | image stays on rig | image goes to anthropic |
+| internet? | no | yes |
+
+text msgs and websearch always stay local — only requests carrying an image get sent to anthropic, and only when u've configured the bridge.
+
+requires `pip install anthropic`. already in `requirements.txt`.
+
+env vars:
+| var | default | does |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | (empty) | required if VISION_MODEL_NAME starts with `anthropic:` |
+| `ANTHROPIC_MAX_TOKENS` | `1024` | max tokens in the vision reply |
 
 ---
 
@@ -224,7 +295,12 @@ see `.env.example` for the full template. quick ref:
 | `DISCORD_BOT_TOKEN` | — | required. bot token from dev portal |
 | `OLLAMA_URL` | `http://localhost:11434/api/chat` | local ollama chat endpoint |
 | `MODEL_NAME` | `huihui_ai/qwen2.5-coder-abliterate:7b` | pulled ollama model name |
-| `VISION_MODEL_NAME` | `huihui_ai/qwen2.5-vl-abliterated:7b` | model for image attachments |
+| `VISION_MODEL_NAME` | `huihui_ai/qwen2.5-vl-abliterated:7b` | local vision model OR `anthropic:claude-haiku-4-5` for cloud vision |
+| `ANTHROPIC_API_KEY` | (empty) | required if VISION_MODEL_NAME starts with `anthropic:` |
+| `ANTHROPIC_MAX_TOKENS` | `1024` | max output tokens on cloud vision replies |
+| `SEARCH_ENABLED` | `true` | websearch sentinel interception (set `false` to disable) |
+| `SEARCH_MAX_LOOPS` | `3` | max chained searches per single user msg |
+| `SEARCH_MAX_RESULTS` | `5` | results returned per DDG search |
 | `BOT_TRIGGER_NAMES` | `robot,mrrobot,mr robot` | csv trigger words for role-gated invocation |
 | `AUTHORISED_ROLES` | (empty) | csv server role names allowed via triggers |
 | `WHITELIST_USERS` | (empty) | csv discord usernames that bypass triggers |
@@ -253,6 +329,7 @@ ignore them. bot doesnt do voice.
 ```
 mrrobot/
   mrrobot.py            # the bot. has SYSTEM_PROMPT_BASELINE fallback baked in
+  web_search.py         # duckduckgo wrapper for the [WEBSEARCH] sentinel
   system_prompt.txt     # live editable prompt — gitignored, private to ur rig
   start_servitor.bat    # launcher: prompt menu + ollama warmup + bot start
   stop_servitor.bat     # kills SERVITOR python process

@@ -101,13 +101,21 @@ echo.
 echo   Coder model warm.
 
 REM ---- Step 3: Preload vision model (skipped silently if not yet pulled) ----
+REM Check /api/tags FIRST so we never trigger an Ollama background download.
 echo.
-echo [3/4] Preloading vision model...
-curl -s -X POST http://localhost:11434/api/generate -H "Content-Type: application/json" -d "{\"model\":\"huihui_ai/qwen2.5-vl-abliterated:7b\",\"keep_alive\":-1,\"options\":{\"num_ctx\":4096}}" >NUL 2>&1
+echo [3/4] Checking vision model...
+curl -s --max-time 5 http://localhost:11434/api/tags 2>NUL | findstr /C:"qwen2.5-vl-abliterated:7b" >NUL
 if errorlevel 1 (
-    echo   Vision model not pulled yet - vision queries will cold-load on first use.
+    echo   Vision model not pulled - skipping preload.
+    echo   To enable vision: ollama pull huihui_ai/qwen2.5-vl-abliterated:7b
 ) else (
-    echo   Vision model warm.
+    echo   Vision model found - warming up...
+    curl -s --max-time 60 -X POST http://localhost:11434/api/generate -H "Content-Type: application/json" -d "{\"model\":\"huihui_ai/qwen2.5-vl-abliterated:7b\",\"keep_alive\":-1,\"options\":{\"num_ctx\":4096}}" >NUL 2>&1
+    if errorlevel 1 (
+        echo   Vision warm-up timed out - will cold-load on first use.
+    ) else (
+        echo   Vision model warm.
+    )
 )
 
 REM ---- Step 4: Launch the bot ----
