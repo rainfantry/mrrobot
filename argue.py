@@ -11,7 +11,9 @@ Wired into mrrobot.py via the !argue command handler.
 """
 
 import os
+import json
 import logging
+import aiohttp
 from anthropic import AsyncAnthropic
 
 log = logging.getLogger("servitor.argue")
@@ -81,3 +83,47 @@ async def analyse(convo_text: str, api_key: str) -> str:
     if not msg.content:
         return "*[argue: empty response from Claude]*"
     return msg.content[0].text
+
+
+async def analyse_local(convo_text: str, ollama_url: str, model: str) -> str:
+    """Run !argue through the LOCAL ollama model instead of Anthropic. Same
+    SYSTEM prompt as analyse() — the comparison stays honest, only the model
+    varies. Quality will be lower than Haiku (see README findings) but useful
+    for A/B testing future model upgrades or running offline.
+
+    ollama_url should be the chat endpoint (default http://localhost:11434/api/chat).
+    model is the ollama model name (e.g. huihui_ai/qwen2.5-coder-abliterate:7b)."""
+    if not convo_text.strip():
+        raise RuntimeError("empty conversation body")
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": ARGUE_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Conversation to analyse (paste from Discord):\n\n{convo_text}"},
+        ],
+        "stream": False,
+        "keep_alive": -1,
+        "options": {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            # System prompt is ~2.5K chars + convo + room for output. Default
+            # 4096 is too tight for analyse — bump to 8192.
+            "num_ctx": 8192,
+            "num_predict": ARGUE_MAX_TOKENS,
+        },
+    }
+
+    log.info(f"[ARGUE] LOCAL analysing {len(convo_text)} chars via {model}")
+    timeout = aiohttp.ClientTimeout(total=180)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(ollama_url, json=payload) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise RuntimeError(f"Ollama returned {resp.status}: {body[:200]}")
+            data = await resp.json()
+
+    text = data.get("message", {}).get("content", "")
+    if not text:
+        return "*[argue local: empty response from ollama]*"
+    return text

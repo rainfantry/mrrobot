@@ -146,26 +146,53 @@ text never leaves ur rig. only the image + ur question goes to anthropic when cl
 
 ### 5.3 !argue (argument analyser)
 
-paste a discord conversation, i analyse it and give u deployable counter-args in ur voice via claude-haiku.
+paste a discord conversation, i analyse it and give u deployable counter-args in ur voice. routes to claude-haiku via anthropic by default.
 
+**default usage (cloud):**
 ```
 !argue <paste the convo right after the command>
 ```
 
-OR reply to a discord msg with just `!argue` and i pull that msg's content as the convo.
+**local fallback (A/B test or offline):**
+```
+!argue --local <paste convo>
+```
 
-what u get back:
+OR reply to a discord msg with just `!argue` (or `!argue --local`) and i pull that msg's content as the convo body.
+
+**what u get back:**
 - **QUICK READ** — 2 sentences on who's winning + the opponent's pattern
 - **CODE BLOCKS** — 3-5 deployable counters, ready to copy-paste raw
 - **RECOMMENDATION** — which to fire first, what to reserve, when to walk
 - **CLOSE** — one cold-exit line for walking away on top
 
-response time: 8-12 sec. cost: ~$0.005 per analysis.
+| route | model | latency | cost | quality |
+|---|---|---|---|---|
+| default (cloud) | `claude-haiku-4-5` | 8-12 sec | ~$0.005 | sharp |
+| `--local` | `huihui_ai/qwen2.5-coder-abliterate:7b` | 30-40 sec | $0 | weak (see findings) |
 
 | env var | default | what it does |
 |---|---|---|
 | `ARGUE_MODEL` | `claude-haiku-4-5` | switch to `claude-sonnet-4-6` for sharper analysis |
 | `ARGUE_MAX_TOKENS` | `2048` | max output length |
+
+### 5.3.1 findings — why u should default to cloud for !argue
+
+i benchmarked both routes on the same discord convo, same system prompt. results:
+
+| dimension | local qwen-coder | cloud haiku | winner |
+|---|---|---|---|
+| followed format | ✓ | ✓ | tie |
+| read who was winning correctly | ❌ said the opponent was winning when he was clearly losing | ✓ identified the retreat pattern | **haiku** |
+| operator voice (lowercase, terse) | ❌ proper grammar, capitalisation | ✓ matched ur style | **haiku** |
+| named fallacies precisely | ❌ generic "ad hominem" only | ✓ named signalling, goalpost shift | **haiku** |
+| counters actually counter | ❌❌ first counter AGREED with the opponent | ✓ counters were sharp | **haiku** |
+| recommendation | ❌ nonsensical | ✓ actionable order | **haiku** |
+| close line | ❌ filler | ✓ cold exit ready | **haiku** |
+
+**the killshot:** local qwen-coder's first counter literally validated the opponent's manosphere talking point. if u'd pasted that into discord u'd have lost the room u'd already won. argument analysis is not a code task — it's a model-of-mind task ("who is the operator, what side, what would land"). 7B coder fine-tunes don't have the reasoning depth.
+
+**verdict:** keep `--local` for A/B testing future model upgrades (when u have a 5090 + can run mixtral or gemma2:27b). for daily use, cloud haiku is the move. $0.005 per fight is cheap.
 
 ---
 

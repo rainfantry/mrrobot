@@ -43,9 +43,10 @@ except ImportError:
     AsyncAnthropic = None
 
 try:
-    from argue import analyse as argue_analyse
+    from argue import analyse as argue_analyse, analyse_local as argue_analyse_local
 except ImportError:
     argue_analyse = None
+    argue_analyse_local = None
 
 load_dotenv(override=True)  # .env wins over pre-existing shell env vars
 
@@ -660,17 +661,21 @@ async def on_message(message):
                 pass
         return
 
-    # ARGUE handler: paste a convo, get back deployable counter-arguments via Anthropic.
-    # Routes to a SEPARATE system prompt (argue.py) — different mind from SERVITOR proper.
+    # ARGUE handler: paste a convo, get back deployable counter-arguments.
+    # Default route: cloud Haiku (sharp). With --local flag: route to local Ollama
+    # qwen-coder (lower quality — see README — but free + offline).
     if is_whitelisted(message.author) and is_argue_command(message.content):
         if argue_analyse is None:
             await message.channel.send("*[!argue: argue.py module not loaded]*")
             return
-        if not ANTHROPIC_API_KEY:
-            await message.channel.send("*[!argue: ANTHROPIC_API_KEY not set in .env]*")
-            return
-        # Strip the prefix; everything after is the convo body
+        # Strip the prefix; everything after is the convo body (and possibly --local flag)
         body = re.sub(r"^[!/]argue\s*", "", message.content, flags=re.IGNORECASE).strip()
+        # Detect the --local flag (must be the FIRST token after !argue)
+        use_local = False
+        m_local = re.match(r"^(--local|local)\b\s*", body, flags=re.IGNORECASE)
+        if m_local:
+            use_local = True
+            body = body[m_local.end():].strip()
         # If body is empty and the operator replied to another msg, use that
         if not body and message.reference:
             try:
@@ -680,18 +685,31 @@ async def on_message(message):
                 log.warning(f"[ARGUE] failed to fetch referenced msg: {exc}")
         if not body:
             await message.channel.send(
-                "*[usage: `!argue <paste convo>` or reply to a msg with `!argue`]*"
+                "*[usage: `!argue <paste convo>`  •  `!argue --local <convo>` for local model A/B  •  reply to a msg with `!argue` to analyse it]*"
             )
             return
-        log.info(f"[ARGUE] {message.author.name} requesting analysis ({len(body)} chars)")
-        placeholder = await message.channel.send("🎯 *analysing argument…*")
+        if not use_local and not ANTHROPIC_API_KEY:
+            await message.channel.send(
+                "*[!argue: ANTHROPIC_API_KEY not set. use `!argue --local <convo>` for the local fallback]*"
+            )
+            return
+        if use_local and argue_analyse_local is None:
+            await message.channel.send("*[!argue --local: aiohttp/argue module unavailable]*")
+            return
+        route = "LOCAL ollama" if use_local else "CLOUD anthropic"
+        log.info(f"[ARGUE] {message.author.name} requesting analysis via {route} ({len(body)} chars)")
+        placeholder_text = "🧪 *analysing argument (local qwen-coder)…*" if use_local else "🎯 *analysing argument…*"
+        placeholder = await message.channel.send(placeholder_text)
         try:
-            result = await argue_analyse(body, ANTHROPIC_API_KEY)
+            if use_local:
+                result = await argue_analyse_local(body, OLLAMA_URL, MODEL_NAME)
+            else:
+                result = await argue_analyse(body, ANTHROPIC_API_KEY)
             chunks = chunk_reply(result, limit=1900)
             await placeholder.edit(content=chunks[0])
             for chunk in chunks[1:]:
                 await message.channel.send(chunk)
-            log.info(f"[ARGUE] analysis returned {len(result)} chars in {len(chunks)} chunk(s)")
+            log.info(f"[ARGUE] {route} analysis returned {len(result)} chars in {len(chunks)} chunk(s)")
         except Exception as exc:
             detail = str(exc)[:200] or type(exc).__name__
             await placeholder.edit(content=f"*[!argue failed: {detail}]*"[:1990])
@@ -744,7 +762,9 @@ async def on_message(message):
             "\n"
             "!argue <paste convo>  OR  reply to a msg with !argue\n"
             "    -> analyse a discord argument, return deployable counter-args\n"
-            "    -> via anthropic API. requires ANTHROPIC_API_KEY in .env\n"
+            "    -> default: cloud claude-haiku (sharp, ~$0.005, 8-12s)\n"
+            "    -> add --local for local qwen-coder (free, weaker, 30-40s)\n"
+            "       e.g. !argue --local <paste convo>\n"
             "```"
         )
         await message.channel.send(text)
