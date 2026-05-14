@@ -243,27 +243,72 @@ spirit, what's MITRE T1021
 
 ## 8. editing my prompt (changing who i am)
 
-my system prompt lives in `system_prompt.txt` next to `mrrobot.py`. i read it on startup. if it's missing or empty, i fall back to the `SYSTEM_PROMPT_BASELINE` constant baked into `mrrobot.py` — i can NEVER be bricked by deleting the file.
+i have a two-file prompt architecture:
 
-### 8.1 via the launcher menu
+```
+SYSTEM_PROMPT_BASELINE        ← baked into mrrobot.py source (public, generic template)
+        ↓ fallback only
+system_prompt.txt             ← live editable, gitignored (private to ur rig)
+```
+
+i read `system_prompt.txt` on startup. if it's missing or empty, i fall back to the baked baseline — i can NEVER be bricked by deleting the file.
+
+### 8.1 first-time setup — fill in THE FILE
+
+on a fresh clone, ur `system_prompt.txt` will be either missing OR a copy of the baseline (depends on whether u ran `[R]` or `--dump-baseline` first). EITHER WAY, the baseline contains a `THE FILE — REPLACE THIS BLOCK` section with a placeholder, not real bio data.
+
+**u must fill that block in.** what to put there:
+
+```
+THE FILE — don't make me repeat it:
+- ur name / callsign / what to call u
+- age, location, anything else u don't want to retype
+- mission / goal chain (escape route, north star)
+- mental state context (sobriety, recovery, medical) — gets read back in WITNESS MODE
+- ur network (people u care about, lost friendships)
+- concrete receipts — specific wins, ship-dates, sustained efforts
+  (without these, WITNESS MODE turns into generic motivation which u'll reject as fake)
+```
+
+the fuller u make THE FILE, the better i can read u back to u when u forget. without it, im just a foul-mouthed but generic assistant.
+
+### 8.2 via the launcher menu
 
 run `start_servitor.bat`, the menu pops:
 - `[E]` opens `system_prompt.txt` in notepad. u edit, save, close. launcher waits till u close, then continues.
 - `[V]` prints the loaded prompt to console.
-- `[R]` factory-resets the file from the embedded baseline.
+- `[R]` factory-resets the file from the embedded baseline. **WARNING: this nukes ur tuning.** back up first.
 
 edits take effect on **next launch** — no hot reload. the launcher kills the old me before relaunching so changes go in clean.
 
-### 8.2 via cli
+### 8.3 backup before [R]
+
+`[R]` overwrites `system_prompt.txt` with the generic baseline. if u've tuned ur prompt over weeks, that's gone in one click. before pressing R, take a timestamped backup:
+
+```powershell
+# windows:
+Copy-Item system_prompt.txt "system_prompt.$(Get-Date -Format yyyy-MM-dd).backup.txt"
+```
 
 ```bash
-python mrrobot.py --show-prompt     # print what i'd load
+# linux/mac:
+cp system_prompt.txt "system_prompt.$(date +%Y-%m-%d).backup.txt"
+```
+
+backup files match the `system_prompt.*.txt` glob in `.gitignore`, so they never accidentally commit.
+
+### 8.4 via cli
+
+```bash
+python mrrobot.py --show-prompt     # print what i'd load (sidecar or baseline)
 python mrrobot.py --dump-baseline   # overwrite system_prompt.txt with baseline
 ```
 
-### 8.3 the gitignore note
+### 8.5 the gitignore note (privacy critical)
 
-`system_prompt.txt` is in `.gitignore`. it's private to ur rig. only the baked-in baseline ships to github. when u clone the repo on another rig, the launcher rebuilds `system_prompt.txt` from the baseline on first run.
+`system_prompt.txt` is in `.gitignore`. it's private to ur rig — contains ur bio, ur receipts, the file SERVITOR holds on u. **never commit it to github**, especially if ur repo is public.
+
+only the baked-in baseline ships to github, and that's a generic template with the personal block stripped. ur tuning stays on ur machine. always. clone the repo on a second machine = u start fresh and re-fill THE FILE there.
 
 ---
 
@@ -463,9 +508,36 @@ ANTHROPIC_API_KEY=sk-ant-api03-yourkey...  # for vision + !argue cloud routes
 VISION_MODEL_NAME=anthropic:claude-haiku-4-5  # cloud vision (recommended for 4GB GPU)
 ```
 
-ur discord username is the lowercase one (e.g. `george.wu14`), NOT the server nickname. find it in discord: User Settings → My Account → Username.
+ur discord username is the lowercase handle (e.g. `your.handle123`), NOT the server nickname. find it in discord: User Settings → My Account → Username.
 
-### 13.5 boot + verify
+> **SECRETS SAFETY — don't fuck this up:**
+> - `.env` is in `.gitignore` for a reason. NEVER commit it. NEVER paste it in screenshots / pastebins.
+> - Discord tokens grant FULL bot control to anyone who has them. If u leak one, immediately reset via developer portal (13.3.2) and update `.env`.
+> - Anthropic API keys are billed per use. A leaked key = someone else racking up charges on ur account.
+> - On `git add`, double-check `git status` shows the bot will NEVER stage `.env` (gitignore handles it, but verify).
+> - The bot fails fast on startup if `DISCORD_BOT_TOKEN` is missing or still the placeholder value — u'll see a banner pointing back to this section.
+
+### 13.5 fill in THE FILE (one-time, before first boot)
+
+the embedded baseline is generic. for SERVITOR to actually witness u, u need to fill in `system_prompt.txt` with ur own bio.
+
+```bash
+# windows:
+python mrrobot.py --dump-baseline      # writes the generic baseline to system_prompt.txt
+notepad system_prompt.txt              # open and edit
+```
+
+inside the file, find the `THE FILE — REPLACE THIS BLOCK` section. replace it with ur actual bio:
+- name / callsign
+- age / location
+- mission (what ur working toward)
+- mental state notes (sobriety, recovery — gets read back in WITNESS MODE)
+- ur network (key people in ur life)
+- concrete receipts (specific wins, dates, sustained efforts)
+
+see section 8.1 for what makes a good FILE block. save the file, close notepad. don't commit it (gitignored).
+
+### 13.6 boot + verify
 
 ```bash
 # windows:
@@ -482,7 +554,9 @@ in discord:
 2. type a msg in a channel where the bot has access AND ur whitelisted
 3. i should reply within ~3-10 sec depending on local LLM speed
 
-### 13.6 first-boot troubleshooting
+if the bot exits immediately with a banner about `DISCORD_BOT_TOKEN not set`, u didn't fill in `.env` properly. go back to 13.4.
+
+### 13.7 first-boot troubleshooting
 
 | symptom | cause | fix |
 |---|---|---|
@@ -496,7 +570,7 @@ in discord:
 | `404 model not found` from ollama | u didn't `ollama pull` the model in 13.1 | `ollama pull huihui_ai/qwen2.5-coder-abliterate:7b` |
 | bot replies "no idea" to everything | model name typo in `.env` `MODEL_NAME=` — falling back to wrong model | check spelling matches `ollama list` output exactly |
 
-### 13.7 second machine deploy (the fast path)
+### 13.8 second machine deploy (the fast path)
 
 once one machine works, replicating on a second machine (e.g. runpod, work laptop):
 

@@ -41,7 +41,14 @@ bot.stdout.log
 
 # Live editable system prompt — private to each operator's rig.
 # Bot reads it at startup with a fallback to SYSTEM_PROMPT_BASELINE in mrrobot.py.
-system_prompt.txt
+# Covers system_prompt.txt + any backup variants (timestamped, "- Copy", .bak, etc).
+system_prompt*.txt
 
 # Pre-extraction backups (safe to delete once the new layout is trusted)
 *.bak_pre_extract
+
+# Diagnostic / one-off scripts that may carry personal context
+oracle_diag_post.py
+
+# Saved PDF copies of README from GitHub view
+mrrobot_README*.pdf
