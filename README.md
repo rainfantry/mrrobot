@@ -344,31 +344,168 @@ ignore them. i dont do voice.
 
 ## 13. installing me from scratch
 
-if u ever rebuild from a fresh rig:
+if u ever rebuild me from a fresh rig — new laptop, runpod, friend's pc, whatever — this is the full walkthrough. nothing skipped. step 13.3 (discord portal) is the part everyone forgets, so it's spelled out clickbyclick.
+
+### 13.1 ollama + the models
 
 ```bash
-# 1. pull the coder model
+# install ollama (one-time per machine)
+#   windows:  https://ollama.com/download → OllamaSetup.exe
+#   linux:    curl -fsSL https://ollama.com/install.sh | sh
+#   mac:      brew install ollama
+
+# start the ollama daemon (must be running before i boot)
+ollama serve
+
+# pull the coder model (~4.7 GB, the brain)
 ollama pull huihui_ai/qwen2.5-coder-abliterate:7b
 
-# 2. set up the python env
+# optional: local vision model (only if u want offline image analysis on this rig)
+ollama pull huihui_ai/qwen2.5-vl-abliterated:7b
+
+# verify
+ollama list
+# should list both models above
+```
+
+### 13.2 python env
+
+```bash
+# python 3.10 or newer required
+git clone https://github.com/rainfantry/mrrobot.git
 cd mrrobot
+
 python -m venv venv
 venv\Scripts\activate          # windows
+# source venv/bin/activate     # linux/mac
+
 pip install -r requirements.txt
-
-# 3. discord bot setup
-#    https://discord.com/developers/applications -> New Application
-#    Bot -> reset token, copy it
-#    Privileged Gateway Intents -> enable MESSAGE CONTENT + SERVER MEMBERS
-#    OAuth2 -> URL Generator -> scope=bot, perms=Send Messages, Read Message History, Add Reactions
-
-# 4. config
-cp .env.example .env
-# edit .env: paste token, put ur lowercase username in WHITELIST_USERS
-
-# 5. boot
-start_servitor.bat
 ```
+
+### 13.3 discord developer portal — the part nobody documents properly
+
+this is where every fresh deploy dies. follow exact steps. screenshots in ur head: discord developer portal = the dashboard where u register apps. ur bot is one of those apps.
+
+#### 13.3.1 create the application
+
+1. open **https://discord.com/developers/applications** in browser
+2. log in with the discord account that will OWN the bot (this is ur account — the bot is registered under ur user)
+3. click **"New Application"** (top right, blue button)
+4. name it whatever (e.g. `SERVITOR`, `mrrobot`, `machine-spirit`). doesn't have to match anything in code.
+5. tick the ToS box, click **Create**
+
+ur in the app dashboard now.
+
+#### 13.3.2 bot tab — generate token + enable intents
+
+1. left sidebar → click **"Bot"**
+2. **token area** at top:
+   - click **"Reset Token"** button (yes even on first setup — there's no "show" option, only reset-then-copy)
+   - confirm the reset
+   - the new token appears ONCE — copy it immediately. if u lose it u have to reset again.
+   - token looks like `MTIzNDU2Nzg5MDEyMzQ1Njc4OTA.GxYz.aBcDeFgHiJkLmNoPqRsTuVwXyZ`
+   - **save it** — this goes in `.env` as `DISCORD_BOT_TOKEN` (step 13.4)
+   - this token is a password — anyone with it can puppet ur bot. don't commit it. don't paste it in screenshots.
+
+3. scroll down to **"Privileged Gateway Intents"** section:
+   - **MESSAGE CONTENT INTENT** → toggle ON (required so i can read what u type)
+   - **SERVER MEMBERS INTENT** → toggle ON (required so whitelist + role matching works)
+   - **PRESENCE INTENT** → leave OFF (not used)
+   - scroll to bottom of page, click **"Save Changes"** (the green bar pops up bottom of screen)
+
+4. optional cosmetic stuff on this page:
+   - **Public Bot** toggle → leave ON for ur own server use. turn OFF if u want to prevent random people inviting it to their servers
+   - upload an avatar if u want — affects how i show in discord member list
+
+#### 13.3.3 OAuth2 → URL Generator — making the invite link
+
+1. left sidebar → expand **"OAuth2"** → click **"URL Generator"**
+2. **scopes** section (top): tick ONE box → `bot`
+3. **bot permissions** section appears below: tick these:
+   - **Send Messages** (required — i need this to reply)
+   - **Read Message History** (required — for memory + reply context)
+   - **Add Reactions** (required — for 🛑 ⏭️ 💤 feedback emojis)
+   - **Attach Files** (optional — only needed if u want me to upload generated files)
+   - **Embed Links** (optional — for richer link previews)
+   - **Use External Emojis** (optional — if u want server custom emojis to render)
+4. scroll to bottom → **"Generated URL"** field — copy that whole URL
+   - looks like `https://discord.com/oauth2/authorize?client_id=123...&permissions=274877975616&scope=bot`
+
+#### 13.3.4 invite the bot to ur server
+
+1. paste the URL from 13.3.3 into a browser address bar, hit enter
+2. discord shows an "Add to Server" page:
+   - dropdown: pick the server u want the bot in
+   - (u need **Manage Server** permission on that server)
+3. shows the permissions u're granting → click **"Authorize"**
+4. solve CAPTCHA if it pops
+5. ✓ bot now appears in the server's member list — but **offline** (grey dot) until u actually run me
+
+if u screwed up permissions, just paste the URL again with corrected scopes — invite will overwrite.
+
+### 13.4 .env configuration
+
+```bash
+cp .env.example .env
+# or on windows:
+copy .env.example .env
+```
+
+edit `.env` with the values u collected:
+
+```ini
+# minimum required for first boot:
+DISCORD_BOT_TOKEN=MTIzNDU2Nzg5MDEyMzQ1Njc4OTA.GxYz.actualToken...
+WHITELIST_USERS=ur_discord_username_lowercase
+
+# optional but recommended:
+ANTHROPIC_API_KEY=sk-ant-api03-yourkey...  # for vision + !argue cloud routes
+VISION_MODEL_NAME=anthropic:claude-haiku-4-5  # cloud vision (recommended for 4GB GPU)
+```
+
+ur discord username is the lowercase one (e.g. `george.wu14`), NOT the server nickname. find it in discord: User Settings → My Account → Username.
+
+### 13.5 boot + verify
+
+```bash
+# windows:
+start_servitor.bat
+
+# linux/mac:
+source venv/bin/activate
+ollama serve &     # if not already running
+python mrrobot.py
+```
+
+in discord:
+1. the bot's status dot should turn **green** in member list within ~5 sec
+2. type a msg in a channel where the bot has access AND ur whitelisted
+3. i should reply within ~3-10 sec depending on local LLM speed
+
+### 13.6 first-boot troubleshooting
+
+| symptom | cause | fix |
+|---|---|---|
+| `Improper token has been passed` | wrong token in `.env`, OR token has whitespace/newline around it | reset token in dev portal, copy fresh, paste cleanly into `.env` |
+| `PrivilegedIntentsRequired` error | u didn't enable MESSAGE CONTENT / SERVER MEMBERS in dev portal | go back to 13.3.2 step 3, toggle them ON, save |
+| bot status stays offline / grey | token wrong OR ollama not running | check `ollama list` returns models; check `.env` has clean token |
+| bot online but ignores u | u're not in `WHITELIST_USERS`, OR u're using wrong username (server nick vs actual username) | check User Settings → My Account → Username (the lowercase one) |
+| `Missing Access` when sending | bot's server role is below the channel's required role | server settings → roles → drag bot's role higher |
+| `Cannot send messages in this channel` | bot wasn't invited with Send Messages permission | re-run 13.3.3 with all required perms ticked, re-invite |
+| `ConnectionRefusedError` on ollama call | `ollama serve` not running | run `ollama serve` in a separate terminal |
+| `404 model not found` from ollama | u didn't `ollama pull` the model in 13.1 | `ollama pull huihui_ai/qwen2.5-coder-abliterate:7b` |
+| bot replies "no idea" to everything | model name typo in `.env` `MODEL_NAME=` — falling back to wrong model | check spelling matches `ollama list` output exactly |
+
+### 13.7 second machine deploy (the fast path)
+
+once one machine works, replicating on a second machine (e.g. runpod, work laptop):
+
+1. `git clone https://github.com/rainfantry/mrrobot.git` + 13.2 (python env)
+2. copy `.env` from first rig to second (carry over DISCORD_BOT_TOKEN, WHITELIST_USERS, ANTHROPIC_API_KEY — these are user/server-bound, not rig-bound)
+3. `ollama pull` the models on the new rig (each rig needs its own model files)
+4. `start_servitor.bat`
+
+ONE caveat: discord only lets one connection per bot token at a time. if u start me on machine A then on machine B with the same token, A disconnects. either run me on one rig at a time, OR register a second discord app + bot for the second rig (10 min, follow 13.3 again).
 
 ---
 
