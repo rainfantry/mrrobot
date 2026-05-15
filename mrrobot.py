@@ -50,8 +50,10 @@ except ImportError:
 
 try:
     from comfyui_bridge import generate_image as comfy_generate
+    from comfyui_bridge import COMFY_SCENE_TEMPLATE_PATH
 except ImportError:
     comfy_generate = None
+    COMFY_SCENE_TEMPLATE_PATH = None
 
 load_dotenv(override=True)  # .env wins over pre-existing shell env vars
 
@@ -81,7 +83,12 @@ SEARCH_MAX_RESULTS = int(os.getenv("SEARCH_MAX_RESULTS", "5"))
 # the runtime intercepts, calls comfyui_bridge, posts image, re-prompts the model.
 # Cap loops so the model doesn't infinitely spam image generation.
 GENERATE_ENABLED   = os.getenv("GENERATE_ENABLED", "true").lower() in ("true", "1", "yes")
-GENERATE_MAX_LOOPS = int(os.getenv("GENERATE_MAX_LOOPS", "2"))
+# GENERATE_MAX_LOOPS supports:
+#   "N"  -> hard cap of N images per user turn
+#   "-1" / "none" / "unlimited" -> no cap (set None internally)
+#   "0"  -> hard disable (any positive emission rejected)
+_gml_raw = os.getenv("GENERATE_MAX_LOOPS", "2").lower().strip()
+GENERATE_MAX_LOOPS = None if _gml_raw in ("-1", "none", "unlimited", "infinite") else int(_gml_raw)
 
 # Anthropic vision bridge. When VISION_MODEL_NAME starts with "anthropic:",
 # image-bearing requests route to the Anthropic API instead of local Ollama.
@@ -273,6 +280,16 @@ def _load_system_prompt():
 
 SYSTEM_PROMPT = _load_system_prompt()
 
+# Minimal system prompt for vision calls. Small vision models (moondream:1.8b,
+# llava-phi3:3.8b) get confused by the full persona prompt and return garbage
+# ("?'" or empty). This prompt is direct and instructs the model to describe
+# what it sees. Override via VISION_SYSTEM_PROMPT env var if you want a different
+# vision-side behavior.
+VISION_SYSTEM_PROMPT = os.getenv(
+    "VISION_SYSTEM_PROMPT",
+    "Describe the image in detail."
+)
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -288,6 +305,7 @@ STOP_PHRASES = ("stfu", "shut up", "shutup", "shut the fuck up", "!stop", "!kill
 SKIP_PHRASES = ("!skip", "skip", "next")
 ARGUE_PHRASES = ("!argue", "/argue")
 GEN_PHRASES   = ("!gen", "/gen")
+SCENE_PHRASES = ("!scene", "/scene")
 
 # Sentinel: matches "[WEBSEARCH]: <query>" terminated by newline OR [STOPPED.
 # Mid-stream: requires a terminator so we don't fire on partial query tokens.
@@ -304,14 +322,16 @@ WEBSEARCH_NAKED_RE = re.compile(
 )
 
 # [GENERATE]: sentinel — same family as WEBSEARCH but routes to ComfyUI.
+# Optional [GENERATE-SEED <int>]: form pins the seed for reproducible variants.
+# group(1) = optional seed (str or None), group(2) = prompt.
 # Mid-stream: terminated by newline OR [STOPPED.
 GENERATE_RE = re.compile(
-    r"\[GENERATE\]:\s*([^\n\r]+?)\s*(?:[\n\r]|\[STOPPED)",
+    r"\[GENERATE(?:-SEED\s+(-?\d+))?\]:\s*([^\n\r]+?)\s*(?:[\n\r]|\[STOPPED)",
     re.IGNORECASE,
 )
 # End-of-stream fallback for models that emit and just stop.
 GENERATE_NAKED_RE = re.compile(
-    r"\[GENERATE\]:\s*([^\n\r]+)\s*\Z",
+    r"\[GENERATE(?:-SEED\s+(-?\d+))?\]:\s*([^\n\r]+)\s*\Z",
     re.IGNORECASE,
 )
 
@@ -362,6 +382,47 @@ def is_gen_command(content):
         if c == p or c.startswith(p + " ") or c.startswith(p + "\n"):
             return True
     return False
+
+
+def is_scene_command(content):
+    """!scene <prompt>  — landscape/scene gen via scene_template.json (no LoRA, no trigger)."""
+    c = content.lstrip().lower()
+    for p in SCENE_PHRASES:
+        if c == p or c.startswith(p + " ") or c.startswith(p + "\n"):
+            return True
+    return False
+
+
+def _make_progress_callback(placeholder, prefix, throttle_sec=2.0, bar_width=20):
+    """
+    Build a throttled async on_progress(current, total) for ComfyUI generation.
+
+    Edits `placeholder` with a Unicode progress bar, appended to `prefix`.
+    Throttled to ~1 edit per `throttle_sec` seconds to stay under Discord's
+    edit rate limits (~5 per 5s per channel). Final step (current==total)
+    always renders regardless of throttle.
+
+    Used by !gen / !scene / [GENERATE]: sentinel paths.
+    """
+    state = {"last_edit": 0.0}
+
+    async def on_progress(current, total):
+        now = time.monotonic()
+        # Always show the final tick. Otherwise throttle.
+        if current < total and (now - state["last_edit"]) < throttle_sec:
+            return
+        filled = int(bar_width * current / total) if total else 0
+        bar = "█" * filled + "░" * (bar_width - filled)
+        pct = int(100 * current / total) if total else 0
+        try:
+            await placeholder.edit(
+                content=f"{prefix}`{pct}%` ({current}/{total}) `[{bar}]`"
+            )
+            state["last_edit"] = now
+        except discord.HTTPException:
+            pass  # rate-limited or message gone — skip silently
+
+    return on_progress
 
 
 def is_whitelisted(author):
@@ -513,11 +574,18 @@ def _pick_model(messages):
     return VISION_MODEL_NAME if _has_images(messages) else MODEL_NAME
 
 
+def _pick_system_prompt(messages):
+    """Minimal vision-side prompt when images are present, otherwise full persona.
+    Small vision models (moondream:1.8b, llava-phi3) choke on persona-heavy
+    prompts and return garbage. Persona stays for all text chat."""
+    return VISION_SYSTEM_PROMPT if _has_images(messages) else SYSTEM_PROMPT
+
+
 async def query_ollama(messages):
     model = _pick_model(messages)
     payload = {
         "model": model,
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+        "messages": [{"role": "system", "content": _pick_system_prompt(messages)}] + messages,
         "stream": False,
         "keep_alive": -1,
         "options": {
@@ -543,7 +611,7 @@ async def stream_ollama(messages):
     log.info(f"Ollama model -> {model} (vision={_has_images(messages)})")
     payload = {
         "model": model,
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+        "messages": [{"role": "system", "content": _pick_system_prompt(messages)}] + messages,
         "stream": True,
         "keep_alive": -1,
         "options": {
@@ -637,7 +705,7 @@ async def stream_anthropic_vision(messages):
     async with client.messages.stream(
         model=model,
         max_tokens=ANTHROPIC_MAX_TOK,
-        system=SYSTEM_PROMPT,
+        system=_pick_system_prompt(messages),
         messages=[{"role": "user", "content": content_blocks}],
     ) as stream:
         async for delta in stream.text_stream:
@@ -811,9 +879,17 @@ async def on_message(message):
             return
         log.info(f"[GEN] {message.author.name} requesting image (seed={seed}, {len(body)} chars): {body[:100]}")
         placeholder = await message.channel.send("🎨 *generating via ComfyUI…*")
+        on_progress = _make_progress_callback(
+            placeholder, prefix="🎨 *generating via ComfyUI*\n"
+        )
         try:
-            png_bytes = await comfy_generate(user_prompt=body, seed=seed)
-            await placeholder.edit(content=f"`{body[:200]}`" + (f" — seed `{seed}`" if seed is not None else ""))
+            png_bytes, seed_used = await comfy_generate(
+                user_prompt=body, seed=seed, on_progress=on_progress,
+            )
+            # Show full prompt in fenced block + seed. Soft-truncate only if
+            # the prompt would push past Discord's 2000-char message limit.
+            prompt_display = body if len(body) <= 1800 else (body[:1800] + "…")
+            await placeholder.edit(content=f"seed `{seed_used}`\n```\n{prompt_display}\n```")
             await message.channel.send(
                 file=discord.File(io.BytesIO(png_bytes), filename="gen.png")
             )
@@ -833,6 +909,67 @@ async def on_message(message):
             detail = str(exc)[:200] or type(exc).__name__
             await placeholder.edit(content=f"*[!gen unexpected: {type(exc).__name__}: {detail}]*"[:1990])
             log.exception("[GEN] unexpected failure")
+        return
+
+    # SCENE handler: landscape/wallpaper/cityscape gen via scene_template.json.
+    # No LoRA, no TRIGGER_TOKEN auto-prepend, 1216x832 landscape, scene-tuned sampler.
+    # Whitelist-gated. Manual prompting only — does NOT touch system_prompt.txt or
+    # the natural-language [GENERATE]: sentinel path.
+    if is_whitelisted(message.author) and is_scene_command(message.content):
+        if comfy_generate is None or COMFY_SCENE_TEMPLATE_PATH is None:
+            await message.channel.send("*[!scene: comfyui_bridge.py not found — check install]*")
+            return
+        body = re.sub(r"^[!/]scene\s*", "", message.content, flags=re.IGNORECASE).strip()
+        seed = None
+        m_seed = re.match(r"^--seed\s+(-?\d+)\s+(.+)$", body, flags=re.IGNORECASE | re.DOTALL)
+        if m_seed:
+            try:
+                seed = int(m_seed.group(1))
+                body = m_seed.group(2).strip()
+            except (ValueError, IndexError):
+                pass
+        if not body:
+            await message.channel.send(
+                "*[usage: `!scene <prompt>`  •  `!scene --seed 42 <prompt>` for fixed seed]*\n"
+                "*example: `!scene cinematic tokyo cityscape at night, neon rain, blade runner aesthetic, empty street, dramatic perspective`*"
+            )
+            return
+        log.info(f"[SCENE] {message.author.name} requesting scene (seed={seed}, {len(body)} chars): {body[:100]}")
+        placeholder = await message.channel.send("🌆 *generating scene via ComfyUI…*")
+        on_progress = _make_progress_callback(
+            placeholder, prefix="🌆 *generating scene via ComfyUI*\n"
+        )
+        try:
+            png_bytes, seed_used = await comfy_generate(
+                user_prompt=body,
+                seed=seed,
+                template_path=COMFY_SCENE_TEMPLATE_PATH,
+                skip_trigger=True,
+                on_progress=on_progress,
+            )
+            # Show full prompt in fenced block + seed. Soft-truncate only if
+            # the prompt would push past Discord's 2000-char message limit.
+            prompt_display = body if len(body) <= 1800 else (body[:1800] + "…")
+            await placeholder.edit(content=f"seed `{seed_used}`\n```\n{prompt_display}\n```")
+            await message.channel.send(
+                file=discord.File(io.BytesIO(png_bytes), filename="scene.png")
+            )
+            try:
+                await message.add_reaction("✅")
+            except Exception:
+                pass
+            log.info(f"[SCENE] delivered {len(png_bytes):,} bytes to {message.author.name} seed={seed_used}")
+        except TimeoutError as exc:
+            await placeholder.edit(content=f"*[!scene timed out: {str(exc)[:200]}]*")
+            log.warning(f"[SCENE] timeout: {exc}")
+        except RuntimeError as exc:
+            detail = str(exc)[:300] or type(exc).__name__
+            await placeholder.edit(content=f"*[!scene failed: {detail}]*"[:1990])
+            log.exception("[SCENE] ComfyUI bridge failed")
+        except Exception as exc:
+            detail = str(exc)[:200] or type(exc).__name__
+            await placeholder.edit(content=f"*[!scene unexpected: {type(exc).__name__}: {detail}]*"[:1990])
+            log.exception("[SCENE] unexpected failure")
         return
 
     # AUTH handler: list whitelisted operators (whitelist-only, no LLM)
@@ -971,6 +1108,7 @@ async def on_message(message):
                 SOFT_LIMIT = 1900
                 sentinel_query = None      # WEBSEARCH
                 generate_prompt = None     # GENERATE
+                generate_seed = None       # optional pinned seed (GENERATE-SEED form)
 
                 async for tok in _select_stream(history):
                     full_reply += tok
@@ -987,11 +1125,13 @@ async def on_message(message):
 
                     # GENERATE sentinel: detect [GENERATE]: <prompt>\n...[STOPPED
                     # Only intercept if enabled, bridge loaded, and budget remaining.
+                    # None == unlimited (skip cap check).
                     if (GENERATE_ENABLED and comfy_generate is not None
-                            and generate_loops < GENERATE_MAX_LOOPS):
+                            and (GENERATE_MAX_LOOPS is None or generate_loops < GENERATE_MAX_LOOPS)):
                         g = GENERATE_RE.search(full_reply)
                         if g:
-                            generate_prompt = g.group(1).strip()
+                            generate_seed = int(g.group(1)) if g.group(1) else None
+                            generate_prompt = g.group(2).strip()
                             break  # exit token loop, handle sentinel below
 
                     # SOFT_LIMIT split (split long replies across multiple Discord msgs)
@@ -1032,10 +1172,11 @@ async def on_message(message):
                 # Same naked-fallback for GENERATE
                 if (generate_prompt is None and GENERATE_ENABLED
                         and comfy_generate is not None
-                        and generate_loops < GENERATE_MAX_LOOPS):
+                        and (GENERATE_MAX_LOOPS is None or generate_loops < GENERATE_MAX_LOOPS)):
                     g_naked = GENERATE_NAKED_RE.search(full_reply.rstrip())
                     if g_naked:
-                        generate_prompt = g_naked.group(1).strip()
+                        generate_seed = int(g_naked.group(1)) if g_naked.group(1) else None
+                        generate_prompt = g_naked.group(2).strip()
 
                 if sentinel_query:
                     # WEBSEARCH path: announce, run search, re-prompt
@@ -1068,19 +1209,36 @@ async def on_message(message):
                 if generate_prompt:
                     # GENERATE path: announce, call ComfyUI bridge, post image, re-prompt
                     generate_loops += 1
-                    log.info(f"[GEN-SENTINEL] ({generate_loops}/{GENERATE_MAX_LOOPS}): {generate_prompt!r}")
+                    log.info(f"[GEN-SENTINEL] ({generate_loops}/{GENERATE_MAX_LOOPS if GENERATE_MAX_LOOPS is not None else '∞'}): {generate_prompt!r}")
                     try:
                         await sent_msg.delete()
                     except Exception:
                         pass
+                    # Show full prompt in fenced code block. Soft-truncate only if
+                    # the prompt would push past Discord's 2000-char message limit.
+                    prompt_display = generate_prompt if len(generate_prompt) <= 1900 else (generate_prompt[:1900] + "…")
+                    gen_announce = None
                     try:
-                        await message.channel.send(f"🎨 generating: `{generate_prompt[:200]}`")
+                        gen_announce = await message.channel.send(f"🎨 generating:\n```\n{prompt_display}\n```")
                     except Exception:
                         pass
+                    # Progress callback: edit the announce message (which has the
+                    # prompt in it) appending a live progress bar.
+                    sentinel_on_progress = None
+                    if gen_announce is not None:
+                        sentinel_on_progress = _make_progress_callback(
+                            gen_announce,
+                            prefix=f"🎨 generating:\n```\n{prompt_display}\n```\n",
+                        )
                     try:
-                        png_bytes = await comfy_generate(user_prompt=generate_prompt)
+                        png_bytes, seed_used = await comfy_generate(
+                            user_prompt=generate_prompt,
+                            seed=generate_seed,
+                            on_progress=sentinel_on_progress,
+                        )
                         await message.channel.send(
-                            file=discord.File(io.BytesIO(png_bytes), filename="gen.png")
+                            content=f"*seed `{seed_used}`*",
+                            file=discord.File(io.BytesIO(png_bytes), filename="gen.png"),
                         )
                         history.append({"role": "assistant", "content": full_reply})
                         history.append({
@@ -1088,16 +1246,19 @@ async def on_message(message):
                             "content": (
                                 f"<<<IMAGE_GENERATED>>>\n"
                                 f"prompt: {generate_prompt}\n"
+                                f"seed: {seed_used}\n"
                                 f"filename: gen.png\n"
                                 f"<<<END>>>\n"
                                 f"The image was generated and posted to the channel "
-                                f"successfully. Continue naturally — react to it briefly "
-                                f"in your voice, comment, or ask the operator if they "
-                                f"want a variation. Do NOT emit another [GENERATE] "
-                                f"sentinel unless explicitly asked for another image."
+                                f"successfully. The seed was {seed_used} — u can mention "
+                                f"it casually if u want operator to note it as a keeper. "
+                                f"Continue naturally — react to it briefly in your voice, "
+                                f"comment, or ask the operator if they want a variation. "
+                                f"Do NOT emit another [GENERATE] sentinel unless "
+                                f"explicitly asked for another image."
                             ),
                         })
-                        log.info(f"[GEN-SENTINEL] delivered {len(png_bytes):,} bytes")
+                        log.info(f"[GEN-SENTINEL] delivered {len(png_bytes):,} bytes seed={seed_used}")
                     except Exception as exc:
                         log.exception("[GEN-SENTINEL] generation failed")
                         history.append({"role": "assistant", "content": full_reply})
