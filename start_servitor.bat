@@ -3,10 +3,20 @@ title SERVITOR Launcher
 chcp 65001 >nul
 cd /d "%~dp0"
 
+REM ---- Read model names from .env (fallback defaults if missing) ----
+set "MODEL_NAME=huihui_ai/qwen2.5-vl-abliterated:3b"
+set "VISION_MODEL_NAME=huihui_ai/qwen2.5-vl-abliterated:3b"
+if exist "%~dp0.env" (
+    for /f "tokens=1,* delims==" %%A in ('findstr /B /C:"MODEL_NAME=" "%~dp0.env"') do set "MODEL_NAME=%%B"
+    for /f "tokens=1,* delims==" %%A in ('findstr /B /C:"VISION_MODEL_NAME=" "%~dp0.env"') do set "VISION_MODEL_NAME=%%B"
+)
+
 echo.
 echo ============================================
 echo === SERVITOR LAUNCHER ===
 echo ============================================
+echo   Text model:   %MODEL_NAME%
+echo   Vision model: %VISION_MODEL_NAME%
 
 REM ---- BOOTSTRAP: ensure system_prompt.txt exists ----
 if not exist "%~dp0system_prompt.txt" (
@@ -93,28 +103,32 @@ if errorlevel 1 (
 )
 echo   Ollama is up.
 
-REM ---- Step 2: Preload coder model with permanent keep-alive ----
+REM ---- Step 2: Preload text model with permanent keep-alive ----
 echo.
-echo [2/4] Preloading coder model into RAM (cold start can take 30-60s)...
-curl -s -X POST http://localhost:11434/api/generate -H "Content-Type: application/json" -d "{\"model\":\"huihui_ai/qwen2.5-coder-abliterate:7b\",\"keep_alive\":-1,\"options\":{\"num_ctx\":4096}}"
+echo [2/4] Preloading text model into RAM (cold start can take 30-60s)...
+echo   -^> %MODEL_NAME%
+curl -s -X POST http://localhost:11434/api/generate -H "Content-Type: application/json" -d "{\"model\":\"%MODEL_NAME%\",\"keep_alive\":-1,\"options\":{\"num_ctx\":4096}}"
 echo.
-echo   Coder model warm.
+echo   Text model warm.
 
-REM ---- Step 3: Preload vision model (skipped silently if not yet pulled) ----
-REM Check /api/tags FIRST so we never trigger an Ollama background download.
+REM ---- Step 3: Preload vision model (skip if same as text model — already warm) ----
 echo.
 echo [3/4] Checking vision model...
-curl -s --max-time 5 http://localhost:11434/api/tags 2>NUL | findstr /C:"qwen2.5-vl-abliterated:7b" >NUL
-if errorlevel 1 (
-    echo   Vision model not pulled - skipping preload.
-    echo   To enable vision: ollama pull huihui_ai/qwen2.5-vl-abliterated:7b
+if /i "%VISION_MODEL_NAME%"=="%MODEL_NAME%" (
+    echo   Vision model is same as text model - already warm. Skipping preload.
 ) else (
-    echo   Vision model found - warming up...
-    curl -s --max-time 60 -X POST http://localhost:11434/api/generate -H "Content-Type: application/json" -d "{\"model\":\"huihui_ai/qwen2.5-vl-abliterated:7b\",\"keep_alive\":-1,\"options\":{\"num_ctx\":4096}}" >NUL 2>&1
+    curl -s --max-time 5 http://localhost:11434/api/tags 2>NUL | findstr /C:"%VISION_MODEL_NAME%" >NUL
     if errorlevel 1 (
-        echo   Vision warm-up timed out - will cold-load on first use.
+        echo   Vision model not pulled - skipping preload.
+        echo   To enable vision: ollama pull %VISION_MODEL_NAME%
     ) else (
-        echo   Vision model warm.
+        echo   Vision model found - warming up: %VISION_MODEL_NAME%
+        curl -s --max-time 60 -X POST http://localhost:11434/api/generate -H "Content-Type: application/json" -d "{\"model\":\"%VISION_MODEL_NAME%\",\"keep_alive\":-1,\"options\":{\"num_ctx\":4096}}" >NUL 2>&1
+        if errorlevel 1 (
+            echo   Vision warm-up timed out - will cold-load on first use.
+        ) else (
+            echo   Vision model warm.
+        )
     )
 )
 

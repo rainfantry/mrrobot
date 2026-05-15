@@ -48,6 +48,11 @@ except ImportError:
     argue_analyse = None
     argue_analyse_local = None
 
+try:
+    from comfyui_bridge import generate_image as comfy_generate
+except ImportError:
+    comfy_generate = None
+
 load_dotenv(override=True)  # .env wins over pre-existing shell env vars
 
 BOT_TOKEN          = os.getenv("DISCORD_BOT_TOKEN")
@@ -60,7 +65,8 @@ WHITELIST_USERS    = [u.strip().lower() for u in os.getenv("WHITELIST_USERS", ""
 BLACKLIST_USERS    = [u.strip().lower() for u in os.getenv("BLACKLIST_USERS", "").split(",") if u.strip()]
 ALLOW_BOT_USERS    = [u.strip().lower() for u in os.getenv("ALLOW_BOT_USERNAMES", "").split(",") if u.strip()]
 HISTORY_DEPTH      = int(os.getenv("HISTORY_DEPTH", "12"))
-REQUEST_TIMEOUT    = int(os.getenv("REQUEST_TIMEOUT", "120"))
+_to_raw            = os.getenv("REQUEST_TIMEOUT", "120").lower().strip()
+REQUEST_TIMEOUT    = None if _to_raw in ("0", "none", "infinite", "-1") else int(_to_raw)
 MAX_REPLY_CHARS    = 1900
 
 # Websearch tool (DuckDuckGo via ddgs lib). When the model emits
@@ -274,6 +280,7 @@ skip_streams = set()  # channel_ids whose current cancel was a !skip (delete vs 
 STOP_PHRASES = ("stfu", "shut up", "shutup", "shut the fuck up", "!stop", "!kill")
 SKIP_PHRASES = ("!skip", "skip", "next")
 ARGUE_PHRASES = ("!argue", "/argue")
+GEN_PHRASES   = ("!gen", "/gen")
 
 # Sentinel: matches "[WEBSEARCH]: <query>" terminated by newline OR [STOPPED.
 # Mid-stream: requires a terminator so we don't fire on partial query tokens.
@@ -323,6 +330,15 @@ def is_argue_command(content):
     """!argue <pasted convo>  or  !argue (when replying to another msg)."""
     c = content.lstrip().lower()
     for p in ARGUE_PHRASES:
+        if c == p or c.startswith(p + " ") or c.startswith(p + "\n"):
+            return True
+    return False
+
+
+def is_gen_command(content):
+    """!gen <prompt>  — pipe prompt to local ComfyUI + post the image back."""
+    c = content.lstrip().lower()
+    for p in GEN_PHRASES:
         if c == p or c.startswith(p + " ") or c.startswith(p + "\n"):
             return True
     return False
@@ -400,6 +416,28 @@ async def fetch_attachment(att):
 
     if ext in IMAGE_EXTS:
         try:
+            # Pre-resize large images: vision models internally downscale to ~1024-1536px,
+            # so sending 4K phone photos wastes base64 bandwidth + slows model encoding.
+            # Configurable via VISION_MAX_DIM (default 1536, set to 0 to disable).
+            try:
+                from PIL import Image
+                max_dim = int(os.getenv("VISION_MAX_DIM", "1536"))
+                if max_dim > 0:
+                    img = Image.open(io.BytesIO(raw))
+                    if max(img.size) > max_dim:
+                        img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+                        buf = io.BytesIO()
+                        fmt = "PNG" if ext == ".png" else "JPEG"
+                        if fmt == "JPEG" and img.mode != "RGB":
+                            img = img.convert("RGB")
+                        img.save(buf, format=fmt, quality=92)
+                        raw = buf.getvalue()
+                        log.info(f"resized {att.filename} -> max {max_dim}px ({len(raw):,} bytes)")
+            except ImportError:
+                log.warning("PIL not installed — sending raw image (pip install Pillow to enable resize)")
+            except Exception as resize_err:
+                log.warning(f"image resize failed for {att.filename}: {resize_err} — sending raw")
+
             b64 = base64.b64encode(raw).decode("ascii")
             return ("image", b64)
         except Exception as e:
@@ -728,6 +766,53 @@ async def on_message(message):
             detail = str(exc)[:200] or type(exc).__name__
             await placeholder.edit(content=f"*[!argue failed: {detail}]*"[:1990])
             log.exception("[ARGUE] analysis failed")
+        return
+
+    # GEN handler: pipe prompt to local ComfyUI, post image back.
+    # Whitelist-gated. Trigger token auto-prepend is handled inside comfyui_bridge.
+    # Optional --seed <int> flag for reproducible composition.
+    if is_whitelisted(message.author) and is_gen_command(message.content):
+        if comfy_generate is None:
+            await message.channel.send("*[!gen: comfyui_bridge.py not found — check install]*")
+            return
+        body = re.sub(r"^[!/]gen\s*", "", message.content, flags=re.IGNORECASE).strip()
+        seed = None
+        m_seed = re.match(r"^--seed\s+(-?\d+)\s+(.+)$", body, flags=re.IGNORECASE | re.DOTALL)
+        if m_seed:
+            try:
+                seed = int(m_seed.group(1))
+                body = m_seed.group(2).strip()
+            except (ValueError, IndexError):
+                pass
+        if not body:
+            await message.channel.send(
+                "*[usage: `!gen <prompt>`  •  `!gen --seed 42 <prompt>` for fixed seed]*"
+            )
+            return
+        log.info(f"[GEN] {message.author.name} requesting image (seed={seed}, {len(body)} chars): {body[:100]}")
+        placeholder = await message.channel.send("🎨 *generating via ComfyUI…*")
+        try:
+            png_bytes = await comfy_generate(user_prompt=body, seed=seed)
+            await placeholder.edit(content=f"`{body[:200]}`" + (f" — seed `{seed}`" if seed is not None else ""))
+            await message.channel.send(
+                file=discord.File(io.BytesIO(png_bytes), filename="gen.png")
+            )
+            try:
+                await message.add_reaction("✅")
+            except Exception:
+                pass
+            log.info(f"[GEN] delivered {len(png_bytes):,} bytes to {message.author.name}")
+        except TimeoutError as exc:
+            await placeholder.edit(content=f"*[!gen timed out: {str(exc)[:200]}]*")
+            log.warning(f"[GEN] timeout: {exc}")
+        except RuntimeError as exc:
+            detail = str(exc)[:300] or type(exc).__name__
+            await placeholder.edit(content=f"*[!gen failed: {detail}]*"[:1990])
+            log.exception("[GEN] ComfyUI bridge failed")
+        except Exception as exc:
+            detail = str(exc)[:200] or type(exc).__name__
+            await placeholder.edit(content=f"*[!gen unexpected: {type(exc).__name__}: {detail}]*"[:1990])
+            log.exception("[GEN] unexpected failure")
         return
 
     # AUTH handler: list whitelisted operators (whitelist-only, no LLM)

@@ -196,6 +196,66 @@ i benchmarked both routes on the same discord convo, same system prompt. results
 
 ---
 
+### 5.4 !gen (ComfyUI image generation bridge)
+
+pipe a text prompt to ur local ComfyUI install, post the generated image back to the channel. fully local — no API calls leave ur rig. whitelist-gated.
+
+**usage:**
+```
+!gen at the beach golden hour
+!gen --seed 42 portrait studio lighting
+!gen sks_woman, woman, indoor cafe, warm tungsten light
+```
+
+**flow:**
+1. u type `!gen <prompt>` in any channel where ur whitelisted
+2. bot reacts 🎨 and posts `*generating via ComfyUI…*` placeholder
+3. bridge POSTs the prompt to ComfyUI's HTTP API (`http://localhost:8188/prompt` by default)
+4. ComfyUI cooks for 30-90 sec
+5. bot edits placeholder to show ur prompt + posts the image as a file attachment + reacts ✅
+
+**setup (one time):**
+
+1. install ComfyUI Desktop OR portable. make sure it's running before u use !gen.
+2. set `COMFY_HOST` in `.env` to wherever ComfyUI is reachable. default 8188; many installs use 8000 — check ur ComfyUI startup log for the actual port.
+3. edit `gen_template.json` (next to mrrobot.py) and change:
+   - `"ckpt_name"` → ur SDXL checkpoint filename (must be in `ComfyUI/models/checkpoints/`)
+   - `"lora_name"` → ur LoRA filename (must be in `ComfyUI/models/loras/`)
+   - `"text"` of node 4 → ur negative prompt (anti-artifact pack)
+   - dimensions, sampler, cfg, steps — whatever u tuned
+4. set `TRIGGER_TOKEN` in `.env` to ur LoRA's trigger (e.g. `sks_woman, woman`). bot auto-prepends to any !gen prompt that doesn't already contain it.
+
+**hot-edit:** `gen_template.json` is re-read on EVERY `!gen` call. so u can tune LoRA strength, swap checkpoint, change negatives WHILE the bot runs. no restart needed. test the change on the next `!gen`.
+
+**flags:**
+- `--seed <int>` — fix the seed for reproducible composition. default is random per call.
+
+**dependencies:**
+- ComfyUI running locally (or remote, set `COMFY_HOST`)
+- `comfyui_bridge.py` + `gen_template.json` next to `mrrobot.py`
+- Python `aiohttp` (already a dep)
+
+**diagnose without Discord:** the bridge has a CLI test mode.
+```bash
+python comfyui_bridge.py "test prompt"
+```
+Saves `test_gen.png` next to the script if successful, prints error otherwise. Fastest way to confirm ComfyUI is reachable + workflow loads + LoRA fires before going through the full Discord round-trip.
+
+**troubleshooting:**
+
+| symptom | fix |
+|---|---|
+| `!gen: comfyui_bridge.py not found` | module missing — check it's next to mrrobot.py; restart bot |
+| `can't reach ComfyUI at http://...` | ComfyUI not running OR wrong COMFY_HOST port |
+| `ComfyUI POST /prompt 400` | bad node refs in gen_template.json OR model file missing from `ComfyUI/models/` |
+| generation times out | raise `COMFY_TIMEOUT_SEC` in .env (or set to 0 for unlimited) |
+| face doesn't look right | edit `gen_template.json` → raise `"strength_model"` from 0.9 → 0.95 |
+| outputs too plasticky | edit `gen_template.json` → lower `"cfg"` from 5.0 → 4.5 |
+
+**privacy note:** generated images post to the channel where u invoked `!gen`. anyone in that channel sees them. for sensitive subjects (e.g. real-person face LoRAs), only invoke from channels u fully control or DM-style channels.
+
+---
+
 ## 6. killswitches (when im saying too much)
 
 | u type | what i do | reaction |
@@ -228,6 +288,8 @@ prefix is `!servitor ` for the formal commands. some shortcuts work without it.
 | `who has auth`, `whitelist`, `!auth` | whitelist | show auth roster |
 | `shortcuts`, `!shortcuts`, `!help` | whitelist | show this command list in-channel |
 | `!argue <convo>` | whitelist | argument analyser via anthropic |
+| `!gen <prompt>` | whitelist | local ComfyUI image generation — see §5.4 |
+| `!gen --seed <int> <prompt>` | whitelist | same, with fixed seed for reproducible composition |
 
 ### 7.3 trigger words (for non-whitelist roles)
 
@@ -350,7 +412,13 @@ see `.env.example` for the template. paste it to `.env` and fill in.
 | `ALLOW_BOT_USERNAMES` | (empty) | csv bot usernames i WILL respond to |
 | `BLACKLIST_USERS` | (empty) | csv usernames i ignore entirely |
 | `HISTORY_DEPTH` | `12` | rolling memory size per channel |
-| `REQUEST_TIMEOUT` | `120` | ollama HTTP timeout (seconds) |
+| `REQUEST_TIMEOUT` | `120` | ollama HTTP timeout (sec). 0/none/-1 = wait forever |
+| `VISION_MAX_DIM` | `1536` | pre-resize image attachments to this max dim (0 = disable) |
+| `COMFY_HOST` | `http://localhost:8188` | where ComfyUI HTTP API is reachable (for !gen) |
+| `COMFY_TEMPLATE_PATH` | `gen_template.json` | path to ComfyUI API-format workflow template |
+| `COMFY_TIMEOUT_SEC` | `300` | max wait per !gen call |
+| `COMFY_POLL_INTERVAL` | `1.0` | how often to poll /history for completion |
+| `TRIGGER_TOKEN` | `sks_woman, woman` | auto-prepended to !gen prompts if missing |
 
 ---
 
@@ -360,9 +428,12 @@ see `.env.example` for the template. paste it to `.env` and fill in.
 mrrobot/
   mrrobot.py            # me. has SYSTEM_PROMPT_BASELINE fallback baked in
   argue.py              # !argue command — argument analyser via anthropic
+  comfyui_bridge.py     # !gen command — ComfyUI HTTP API client (async)
+  gen_template.json     # ComfyUI API-format workflow template (hot-editable)
   web_search.py         # duckduckgo wrapper for the [WEBSEARCH] sentinel
   system_prompt.txt     # ur live editable prompt — gitignored, private
   start_servitor.bat    # launcher: prompt menu + ollama warmup + bot start
+                        # auto-reads MODEL_NAME / VISION_MODEL_NAME from .env
   stop_servitor.bat     # kills me
   requirements.txt
   .env.example          # config template
