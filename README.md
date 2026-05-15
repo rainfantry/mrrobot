@@ -254,6 +254,40 @@ Saves `test_gen.png` next to the script if successful, prints error otherwise. F
 
 **privacy note:** generated images post to the channel where u invoked `!gen`. anyone in that channel sees them. for sensitive subjects (e.g. real-person face LoRAs), only invoke from channels u fully control or DM-style channels.
 
+### 5.4.1 natural-language gen (no `!gen` needed)
+
+i can also generate images from conversational requests. just say what u want in natural english:
+
+```
+yo show me her at the beach
+make a pic of her in cyberpunk neon
+i want to see her at golden hour in the park
+draw her wearing a black silk dress
+```
+
+how it works: my LLM emits a `[GENERATE]: <SDXL prompt>` sentinel (same family as `[WEBSEARCH]:` for web search). the runtime intercepts, calls ComfyUI, posts the image, then re-prompts me with a confirmation marker so i can react to what i just "made" in conversation.
+
+required setup:
+1. add the IMAGE GENERATION block to `system_prompt.txt` (teaches the LLM when to emit the sentinel)
+2. keep `GENERATE_ENABLED=true` in `.env` (default)
+3. ComfyUI must be running same as for `!gen` (uses same bridge)
+
+config knobs in `.env`:
+- `GENERATE_ENABLED=true` — set false to disable natural-language gen entirely (forcing operators to use `!gen`)
+- `GENERATE_MAX_LOOPS=2` — max images per user turn. low cap because gen is slow (~30-90 sec each)
+
+**when does the bot emit [GENERATE] vs just describe?**
+
+| operator says | what happens |
+|---|---|
+| "show me her at the beach" | emits `[GENERATE]:`, image cooks, posts to chat |
+| "what does she look like" | describes verbally, no generation |
+| (uploads an image) | vision model reads + describes — no generation |
+| "make another one" | emits `[GENERATE]:` again (up to MAX_LOOPS) |
+| (after 2 gens in a row) | bot stops emitting sentinel until next user msg |
+
+**explicit `!gen` still works** in parallel — use it when u want precise control over the prompt without LLM rewriting. natural-language is for fluid conversation, `!gen` for prompt engineering.
+
 ---
 
 ## 6. killswitches (when im saying too much)
@@ -419,6 +453,8 @@ see `.env.example` for the template. paste it to `.env` and fill in.
 | `COMFY_TIMEOUT_SEC` | `300` | max wait per !gen call |
 | `COMFY_POLL_INTERVAL` | `1.0` | how often to poll /history for completion |
 | `TRIGGER_TOKEN` | `sks_woman, woman` | auto-prepended to !gen prompts if missing |
+| `GENERATE_ENABLED` | `true` | enable natural-language gen via `[GENERATE]:` sentinel — see §5.4.1 |
+| `GENERATE_MAX_LOOPS` | `2` | max image generations per single user turn |
 
 ---
 

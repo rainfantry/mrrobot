@@ -76,6 +76,13 @@ SEARCH_ENABLED     = os.getenv("SEARCH_ENABLED", "true").lower() in ("true", "1"
 SEARCH_MAX_LOOPS   = int(os.getenv("SEARCH_MAX_LOOPS", "3"))
 SEARCH_MAX_RESULTS = int(os.getenv("SEARCH_MAX_RESULTS", "5"))
 
+# === [GENERATE]: sentinel — natural-language image generation ===
+# When the model emits [GENERATE]: <prompt>\n[STOPPED — awaiting image]
+# the runtime intercepts, calls comfyui_bridge, posts image, re-prompts the model.
+# Cap loops so the model doesn't infinitely spam image generation.
+GENERATE_ENABLED   = os.getenv("GENERATE_ENABLED", "true").lower() in ("true", "1", "yes")
+GENERATE_MAX_LOOPS = int(os.getenv("GENERATE_MAX_LOOPS", "2"))
+
 # Anthropic vision bridge. When VISION_MODEL_NAME starts with "anthropic:",
 # image-bearing requests route to the Anthropic API instead of local Ollama.
 # Format: VISION_MODEL_NAME=anthropic:claude-haiku-4-5
@@ -295,6 +302,19 @@ WEBSEARCH_NAKED_RE = re.compile(
     r"\[WEBSEARCH\]:\s*([^\n\r]+)\s*\Z",
     re.IGNORECASE,
 )
+
+# [GENERATE]: sentinel — same family as WEBSEARCH but routes to ComfyUI.
+# Mid-stream: terminated by newline OR [STOPPED.
+GENERATE_RE = re.compile(
+    r"\[GENERATE\]:\s*([^\n\r]+?)\s*(?:[\n\r]|\[STOPPED)",
+    re.IGNORECASE,
+)
+# End-of-stream fallback for models that emit and just stop.
+GENERATE_NAKED_RE = re.compile(
+    r"\[GENERATE\]:\s*([^\n\r]+)\s*\Z",
+    re.IGNORECASE,
+)
+
 AUTH_PHRASES = (
     "who has auth", "whos got auth", "who's got auth", "who got auth",
     "whitelist", "show whitelist", "list whitelist",
@@ -938,17 +958,19 @@ async def on_message(message):
         cancelled = False
         timed_out_or_failed = False
         search_loops = 0       # WEBSEARCH sentinel intercepts so far
+        generate_loops = 0     # GENERATE sentinel intercepts so far
 
         try:
             # Outer loop: each iteration = one ollama call. Sentinel hits trigger
-            # search + re-prompt + another iteration. Normal completion breaks out.
+            # search/gen + re-prompt + another iteration. Normal completion breaks out.
             while True:
                 full_reply = ""
                 current_chunk = ""
                 last_edit = 0.0
                 EDIT_INTERVAL = 0.9
                 SOFT_LIMIT = 1900
-                sentinel_query = None
+                sentinel_query = None      # WEBSEARCH
+                generate_prompt = None     # GENERATE
 
                 async for tok in _select_stream(history):
                     full_reply += tok
@@ -961,6 +983,15 @@ async def on_message(message):
                         m = WEBSEARCH_RE.search(full_reply)
                         if m:
                             sentinel_query = m.group(1).strip()
+                            break  # exit token loop, handle sentinel below
+
+                    # GENERATE sentinel: detect [GENERATE]: <prompt>\n...[STOPPED
+                    # Only intercept if enabled, bridge loaded, and budget remaining.
+                    if (GENERATE_ENABLED and comfy_generate is not None
+                            and generate_loops < GENERATE_MAX_LOOPS):
+                        g = GENERATE_RE.search(full_reply)
+                        if g:
+                            generate_prompt = g.group(1).strip()
                             break  # exit token loop, handle sentinel below
 
                     # SOFT_LIMIT split (split long replies across multiple Discord msgs)
@@ -998,6 +1029,14 @@ async def on_message(message):
                     if m_naked:
                         sentinel_query = m_naked.group(1).strip()
 
+                # Same naked-fallback for GENERATE
+                if (generate_prompt is None and GENERATE_ENABLED
+                        and comfy_generate is not None
+                        and generate_loops < GENERATE_MAX_LOOPS):
+                    g_naked = GENERATE_NAKED_RE.search(full_reply.rstrip())
+                    if g_naked:
+                        generate_prompt = g_naked.group(1).strip()
+
                 if sentinel_query:
                     # WEBSEARCH path: announce, run search, re-prompt
                     search_loops += 1
@@ -1023,6 +1062,55 @@ async def on_message(message):
                     history.append({"role": "assistant", "content": full_reply})
                     history.append({"role": "system", "content": search_block})
                     # Fresh placeholder, loop again
+                    sent_msg = await message.channel.send("⌛ *thinking…*")
+                    continue
+
+                if generate_prompt:
+                    # GENERATE path: announce, call ComfyUI bridge, post image, re-prompt
+                    generate_loops += 1
+                    log.info(f"[GEN-SENTINEL] ({generate_loops}/{GENERATE_MAX_LOOPS}): {generate_prompt!r}")
+                    try:
+                        await sent_msg.delete()
+                    except Exception:
+                        pass
+                    try:
+                        await message.channel.send(f"🎨 generating: `{generate_prompt[:200]}`")
+                    except Exception:
+                        pass
+                    try:
+                        png_bytes = await comfy_generate(user_prompt=generate_prompt)
+                        await message.channel.send(
+                            file=discord.File(io.BytesIO(png_bytes), filename="gen.png")
+                        )
+                        history.append({"role": "assistant", "content": full_reply})
+                        history.append({
+                            "role": "system",
+                            "content": (
+                                f"<<<IMAGE_GENERATED>>>\n"
+                                f"prompt: {generate_prompt}\n"
+                                f"filename: gen.png\n"
+                                f"<<<END>>>\n"
+                                f"The image was generated and posted to the channel "
+                                f"successfully. Continue naturally — react to it briefly "
+                                f"in your voice, comment, or ask the operator if they "
+                                f"want a variation. Do NOT emit another [GENERATE] "
+                                f"sentinel unless explicitly asked for another image."
+                            ),
+                        })
+                        log.info(f"[GEN-SENTINEL] delivered {len(png_bytes):,} bytes")
+                    except Exception as exc:
+                        log.exception("[GEN-SENTINEL] generation failed")
+                        history.append({"role": "assistant", "content": full_reply})
+                        history.append({
+                            "role": "system",
+                            "content": (
+                                f"<<<IMAGE_GEN_FAILED>>>\n"
+                                f"error: {type(exc).__name__}: {str(exc)[:200]}\n"
+                                f"<<<END>>>\n"
+                                f"Generation failed. Tell the operator briefly — most "
+                                f"likely cause is ComfyUI not running or wrong COMFY_HOST."
+                            ),
+                        })
                     sent_msg = await message.channel.send("⌛ *thinking…*")
                     continue
 
