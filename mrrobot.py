@@ -83,6 +83,10 @@ MODEL_PRESETS = {
         "qwen":            "huihui_ai/qwen2.5-coder-abliterate:7b",
         "qwen-coder":      "huihui_ai/qwen2.5-coder-abliterate:7b",
         "abliterated":     "huihui_ai/qwen2.5-coder-abliterate:7b",
+        "nemo":            "krith/mistral-nemo-instruct-2407-abliterated:IQ4_XS",
+        "nemo-12b":        "krith/mistral-nemo-instruct-2407-abliterated:IQ4_XS",
+        "mistral":         "krith/mistral-nemo-instruct-2407-abliterated:IQ4_XS",
+        "mistral-nemo":    "krith/mistral-nemo-instruct-2407-abliterated:IQ4_XS",
     },
     "vision": {
         "vl":              "qwen2.5vl:3b",
@@ -107,6 +111,10 @@ MODEL_DESCRIPTIONS = {
     "huihui_ai/qwen2.5-coder-abliterate:7b":
         "creative. uncensored — best for explicit SDXL prompt composition + "
         "persona chat. tool emission ~50% reliable. ~5GB RAM.",
+    "krith/mistral-nemo-instruct-2407-abliterated:IQ4_XS":
+        "12B abliterated. stronger reasoning + 128k context. great for persona "
+        "swap base — neutral voice, follows SYSTEM prompts faithfully. ~7GB RAM. "
+        "best uncensored generalist u've got.",
     # Vision models
     "qwen2.5vl:3b":
         "default. light + fast (~5-7GB RAM). parallel-safe with ComfyUI + text model. "
@@ -699,9 +707,37 @@ async def _comfy_status():
 
 
 async def _comfy_stop():
-    """Find process listening on COMFY_HOST's port + kill it. Windows-specific
-    using PowerShell + taskkill. Returns human-readable status string."""
+    """Kill ComfyUI completely — both the Electron wrapper (ComfyUI.exe) AND
+    any process listening on COMFY_HOST's port. The /T flag kills child
+    processes too, so the bundled Python server gets cleaned up alongside
+    its Electron parent. Without this, a partial-stop leaves the wrapper
+    alive + blocks fresh `!comfy start`."""
     port = urlparse(COMFY_HOST).port or 8000
+    killed_summary = []
+
+    # Step 1: Nuke ComfyUI.exe (Electron wrapper) AND its children (/T flag).
+    # This catches the Python server too if it was spawned as a child.
+    try:
+        kp = await asyncio.create_subprocess_exec(
+            "taskkill", "/F", "/T", "/IM", "ComfyUI.exe",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(kp.communicate(), timeout=10)
+        out = stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")
+        if kp.returncode == 0:
+            # taskkill prints SUCCESS lines for each PID killed
+            n_killed = out.count("SUCCESS")
+            killed_summary.append(f"ComfyUI.exe x{n_killed} (with children via /T)")
+        elif "not found" in out.lower() or "no tasks" in out.lower():
+            pass  # wrapper wasn't running, that's fine
+        else:
+            killed_summary.append(f"ComfyUI.exe taskkill returned {kp.returncode}: {out[:80].strip()}")
+    except Exception as exc:
+        killed_summary.append(f"ComfyUI.exe kill failed: {exc}")
+
+    # Step 2: Belt-and-suspenders — anything STILL listening on the port?
+    # Catches edge cases (manually-launched python, different parent process)
     try:
         proc = await asyncio.create_subprocess_exec(
             "powershell", "-NoProfile", "-Command",
@@ -710,28 +746,22 @@ async def _comfy_stop():
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-        pids = []
-        seen = set()
-        for line in stdout.decode("utf-8", errors="replace").splitlines():
-            line = line.strip()
-            if line.isdigit() and line not in seen:
-                pids.append(line)
-                seen.add(line)
-        if not pids:
-            return f"no process found on port {port}"
-        killed = []
+        pids = sorted(set(line.strip() for line in stdout.decode("utf-8", errors="replace").splitlines() if line.strip().isdigit()))
         for pid in pids:
             kp = await asyncio.create_subprocess_exec(
-                "taskkill", "/F", "/PID", pid,
+                "taskkill", "/F", "/T", "/PID", pid,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             await asyncio.wait_for(kp.communicate(), timeout=5)
             if kp.returncode == 0:
-                killed.append(pid)
-        return f"killed PID(s): {', '.join(killed)}" if killed else "found PIDs but taskkill failed"
+                killed_summary.append(f"port {port} PID {pid}")
     except Exception as exc:
-        return f"stop failed: {type(exc).__name__}: {exc}"
+        killed_summary.append(f"port-scan kill failed: {exc}")
+
+    if not killed_summary:
+        return f"nothing found (no ComfyUI.exe, no listener on port {port}) — was already stopped?"
+    return "killed: " + " | ".join(killed_summary)
 
 
 async def _comfy_start():
