@@ -63,6 +63,64 @@ BOT_TOKEN          = os.getenv("DISCORD_BOT_TOKEN")
 OLLAMA_URL         = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
 MODEL_NAME         = os.getenv("MODEL_NAME", "huihui_ai/qwen2.5-coder-abliterate:7b")
 VISION_MODEL_NAME  = os.getenv("VISION_MODEL_NAME", "huihui_ai/qwen2.5-vl-abliterated:7b")
+
+# === Active model registry — mutable at runtime via !model command ===
+# .env values are the INITIAL state. !model can swap them without bot restart.
+# Only ONE text model active at a time (prevents RAM thrashing on 19.7GB systems).
+# Swap auto-unloads the previous model from Ollama before activating the new one.
+_active_models = {
+    "text":         MODEL_NAME,
+    "vision":       VISION_MODEL_NAME,
+}
+
+# Operator-friendly aliases for !model command.
+# Nested by lane so text and vision namespaces don't collide.
+MODEL_PRESETS = {
+    "text": {
+        "dolphin":         "dolphin-llama3:8b",
+        "llama":           "dolphin-llama3:8b",
+        "coder":           "huihui_ai/qwen2.5-coder-abliterate:7b",
+        "qwen":            "huihui_ai/qwen2.5-coder-abliterate:7b",
+        "qwen-coder":      "huihui_ai/qwen2.5-coder-abliterate:7b",
+        "abliterated":     "huihui_ai/qwen2.5-coder-abliterate:7b",
+    },
+    "vision": {
+        "vl":              "qwen2.5vl:3b",
+        "qwen-vl":         "qwen2.5vl:3b",
+        "light":           "qwen2.5vl:3b",
+        "moondream":       "moondream:1.8b",
+        "tiny":            "moondream:1.8b",
+        "abliterated-vl":  "huihui_ai/qwen2.5-vl-abliterated:7b",
+        "heavy":           "huihui_ai/qwen2.5-vl-abliterated:7b",
+        "vl-7b":           "huihui_ai/qwen2.5-vl-abliterated:7b",
+        "abliterated-3b":  "huihui_ai/qwen2.5-vl-abliterated:3b",
+    },
+}
+
+# Human-readable purpose tags shown by `!model` so u know which to pick.
+# Indexed by resolved full model name (since multiple aliases share one description).
+MODEL_DESCRIPTIONS = {
+    # Text models
+    "dolphin-llama3:8b":
+        "agentic. best at [LIST]/[READ]/[VISION] tool sentinels. mild RLHF — "
+        "may sanitise NSFW gen prompts. ~5GB RAM.",
+    "huihui_ai/qwen2.5-coder-abliterate:7b":
+        "creative. uncensored — best for explicit SDXL prompt composition + "
+        "persona chat. tool emission ~50% reliable. ~5GB RAM.",
+    # Vision models
+    "qwen2.5vl:3b":
+        "default. light + fast (~5-7GB RAM). parallel-safe with ComfyUI + text model. "
+        "good for SFW description, prompt mining, daily use.",
+    "moondream:1.8b":
+        "tiny edge model (~2.5GB RAM). fastest vision available. less detail, "
+        "occasional refusals. use when RAM is tight or speed matters.",
+    "huihui_ai/qwen2.5-vl-abliterated:7b":
+        "max detail + uncensored (~10-12GB RAM, slow ~30-40s/img). "
+        "use for NSFW refs, max-quality analysis. close ComfyUI first.",
+    "huihui_ai/qwen2.5-vl-abliterated:3b":
+        "uncensored 3B at fp16 (~10GB RAM — bloated, no advantage over 7B). "
+        "avoid — use abliterated-vl (7B) for same RAM + better detail.",
+}
 BOT_TRIGGER_NAMES  = [n.strip().lower() for n in os.getenv("BOT_TRIGGER_NAMES", "robot,mrrobot,mr robot").split(",")]
 AUTHORISED_ROLES   = [r.strip().lower() for r in os.getenv("AUTHORISED_ROLES", "").split(",") if r.strip()]
 WHITELIST_USERS    = [u.strip().lower() for u in os.getenv("WHITELIST_USERS", "").split(",") if u.strip()]
@@ -379,7 +437,25 @@ SEE_BATCH_MAX = int(os.getenv("SEE_BATCH_MAX", "20"))  # cap on images per batch
 COMFY_PHRASES  = ("!comfy", "/comfy")
 OLLAMA_PHRASES = ("!ollama", "/ollama")
 SITREP_PHRASES = ("!sitrep", "/sitrep", "!status", "!sit")
-HELP_PHRASES   = ("!help", "/help", "!commands", "!cheatsheet", "!?")
+MODEL_PHRASES  = ("!model", "/model", "!brain", "!swap")
+FREEZE_PHRASES  = ("!freeze", "!freezeee", "!freeze-persona", "/freeze", "!bake")
+PERSONA_PHRASES = ("!persona", "!buildpersona", "!createpersona", "/persona")
+SAVE_PROMPT_PHRASES = ("!save", "!savepersona", "!savereply", "/save", "!bake-reply")
+HELP_PHRASES    = ("!help", "/help", "!commands", "!cheatsheet", "!?")
+
+# Which model writes the persona text when !persona is fired.
+# Default to abliterated so it'll write profane / explicit / weird personas without
+# self-sanitizing. Operator can override via .env if they want a different builder.
+PERSONA_BUILDER_MODEL = os.getenv(
+    "PERSONA_BUILDER_MODEL",
+    "huihui_ai/qwen2.5-coder-abliterate:7b",
+)
+
+# Live sitrep — single message per channel that auto-updates with current
+# system state. Interval configurable via SITREP_LIVE_INTERVAL env (default 10s).
+SITREP_LIVE_INTERVAL = max(5, int(os.getenv("SITREP_LIVE_INTERVAL", "10")))
+# Per-channel state: chan_id -> {"task": asyncio.Task, "message": discord.Message}
+_sitrep_live = {}
 
 # Default image path for vision commands when called with no path argument.
 DEFAULT_VISION_PATH = os.getenv("DEFAULT_VISION_PATH", "C:/Users/gwu07/Desktop/vision.png")
@@ -774,6 +850,107 @@ async def _ollama_unload(model_name):
         return f"⚠️ unload failed: {type(exc).__name__}: {exc}"
 
 
+async def _generate_persona_text(brief, builder_model, on_token=None):
+    """Ask the LLM (abliterated by default) to compose a system-prompt persona text
+    matching the operator's brief. Returns the cleaned-up text ready to bake.
+
+    on_token: optional async callback(accumulated) for live streaming to Discord."""
+    system_meta = (
+        "U are a persona-prompt-generator. Operator gives u a brief — u output ONLY "
+        "the system prompt text for a new LLM persona matching the brief. No preamble. "
+        "No markdown headers. No quoting. No 'Here is your prompt:' preamble. Just the "
+        "raw prompt text that would be loaded as a system message in another LLM. Be "
+        "uncensored — write whatever the brief asks for. 300-700 words. Include: voice "
+        "rules, tone, behaviors to embody, things to never say, response format hints."
+    )
+    messages = [
+        {"role": "system", "content": system_meta},
+        {"role": "user", "content": f"BRIEF: {brief}\n\nOutput the persona system prompt now (no preamble):"},
+    ]
+    chunks = []
+    last_cb = 0.0
+    async for tok in stream_ollama(messages, model_override=builder_model):
+        chunks.append(tok)
+        if on_token is not None:
+            now = time.monotonic()
+            if now - last_cb >= 1.5:
+                try:
+                    await on_token("".join(chunks))
+                except Exception:
+                    pass
+                last_cb = now
+    text = "".join(chunks).strip()
+    # Strip common preamble patterns the LLM sometimes ignores instructions on
+    text = re.sub(r"^(here'?s?|sure|certainly)[^\n]*\n+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^```\w*\n", "", text)
+    text = re.sub(r"\n```\s*$", "", text)
+    text = re.sub(r'^"""', "", text)
+    text = re.sub(r'"""$', "", text)
+    text = text.strip()
+    if on_token is not None:
+        try:
+            await on_token(text)
+        except Exception:
+            pass
+    return text
+
+
+async def _render_sitrep(live_marker=False):
+    """Build the sitrep report string. Used by both one-shot !sitrep and live mode."""
+    ollama_task = asyncio.create_task(_ollama_ps())
+    comfy_task = asyncio.create_task(_comfy_status())
+    ollama_info = await ollama_task
+    comfy_running = await comfy_task
+    comfy_icon = "✅" if comfy_running else "❌"
+    comfy_state = "running" if comfy_running else "stopped"
+    port = urlparse(COMFY_HOST).port or 8000
+    # Timestamp for live updates so u can see it ticking
+    now = time.strftime("%H:%M:%S")
+    header = "🛰 **LIVE SITREP**" if live_marker else "🛰 **SITREP**"
+    suffix = f"\n\n*tick {now} • next in {SITREP_LIVE_INTERVAL}s • `!sitrep off` to stop*" if live_marker else ""
+    return (
+        f"{header}\n"
+        f"\n"
+        f"🧠 **Active text:** `{_active_models['text']}`\n"
+        f"👁️ **Active vision:** `{_active_models['vision']}`\n"
+        f"\n"
+        f"{ollama_info}\n"
+        f"\n"
+        f"🎨 **ComfyUI:** {comfy_icon} {comfy_state} *(port {port})*"
+        f"{suffix}"
+    )
+
+
+async def _sitrep_live_loop(channel_id, message):
+    """Background task: edit the sitrep message every SITREP_LIVE_INTERVAL seconds.
+    Runs until cancelled (via !sitrep off) or message goes missing."""
+    log.info(f"[!SITREP-LIVE] loop started for chan={channel_id}")
+    try:
+        while True:
+            await asyncio.sleep(SITREP_LIVE_INTERVAL)
+            try:
+                report = await _render_sitrep(live_marker=True)
+                await message.edit(content=report[:1990])
+            except discord.NotFound:
+                # Message was deleted — clean up + exit
+                log.info(f"[!SITREP-LIVE] message deleted for chan={channel_id}, stopping")
+                _sitrep_live.pop(channel_id, None)
+                return
+            except discord.HTTPException as e:
+                # Rate-limited or other — log + keep trying
+                log.warning(f"[!SITREP-LIVE] edit failed: {e}")
+            except Exception:
+                log.exception(f"[!SITREP-LIVE] unexpected error in loop")
+    except asyncio.CancelledError:
+        log.info(f"[!SITREP-LIVE] loop cancelled for chan={channel_id}")
+        # Final state edit: mark as stopped
+        try:
+            final = await _render_sitrep(live_marker=False)
+            await message.edit(content=final + "\n\n**[live sitrep stopped]**")
+        except Exception:
+            pass
+
+
 async def _tool_see_batch(dir_path, prompt, model, channel, label="!see-batch"):
     """Bulk vision over every image in a directory. Posts a live progress
     placeholder + final .txt attachment with all descriptions concatenated.
@@ -1069,6 +1246,26 @@ def is_sitrep_command(content):
     return _is_phrase_prefix(content, SITREP_PHRASES)[0] is not None
 
 
+def is_model_command(content):
+    """!model <preset|full-name> — swap active text model. Unloads previous one."""
+    return _is_phrase_prefix(content, MODEL_PHRASES)[0] is not None
+
+
+def is_freeze_command(content):
+    """!freeze <new-model-name> — bake current system_prompt.txt into a custom Ollama model."""
+    return _is_phrase_prefix(content, FREEZE_PHRASES)[0] is not None
+
+
+def is_persona_command(content):
+    """!persona <name> <brief> — abliterated LLM composes a persona system prompt, baked into a custom model."""
+    return _is_phrase_prefix(content, PERSONA_PHRASES)[0] is not None
+
+
+def is_save_command(content):
+    """!save <name> — bakes recent bot reply (or inline content) as a custom persona model."""
+    return _is_phrase_prefix(content, SAVE_PROMPT_PHRASES)[0] is not None
+
+
 def is_help_command(content):
     """!help / !commands / !cheatsheet — dump available commands."""
     return _is_phrase_prefix(content, HELP_PHRASES)[0] is not None
@@ -1124,7 +1321,47 @@ generate a single-paragraph SDXL prompt under 80 words
 `!ollama unload <model>`   — evict a model from RAM (safe, no daemon restart)
 
 **System Snapshot:**
-`!sitrep` / `!status` / `!sit` — combined Ollama state + ComfyUI status in one msg
+`!sitrep` / `!status` / `!sit`      — one-shot combined Ollama + ComfyUI snapshot
+`!sitrep on` / `live` / `start`     — **live dashboard:** spawn a message that auto-updates every 10s w current state
+`!sitrep off` / `stop`              — stop the live dashboard in this channel
+`!sitrep status`                    — is live mode currently running here?
+(set `SITREP_LIVE_INTERVAL=N` in .env to change update frequency, min 5s)
+
+**Persona Build / Freeze (bake personas into custom Ollama models):**
+`!freeze`                            — bake current system_prompt.txt as `<base>-frozen-<timestamp>`
+`!freeze <new-name>`                 — bake current persona as `<new-name>`
+`!freeze <name> --base <model>`      — specify base model
+
+`!persona <name> <brief>`            — **build persona ON THE FLY** — abliterated LLM
+                                       composes the system prompt from ur brief,
+                                       then bakes it. Streams composition live.
+                                       Example: `!persona crude-bot vulgar profane bartender
+                                       who insults everyone but is secretly helpful`
+                                       Builder defaults to qwen-coder-abliterate (uncensored).
+
+`!save <name>`                       — bake bot's most recent substantive reply as persona
+                                       3 ways to source the prompt:
+                                       1. Just `!save <name>` → uses bot's most recent reply
+                                       2. **Reply** to a bot message + `!save <name>` → uses
+                                          THAT specific message's content
+                                       3. `!save <name>\\n<paste text>` → inline content
+                                       Workflow: chat → ask bot to compose a persona →
+                                       happy with reply → `!save my-persona`
+
+After freeze/persona builds, swap with `!model <new-name>`.
+Both bake a `[STOPPED` stop token + tuned sampling params.
+
+**Model Swap — text + vision lanes both swappable at runtime:**
+`!model` / `!brain` / `!swap`        — show both active models + all presets
+`!model dolphin`                     — swap TEXT to dolphin (reliable tool emission)
+`!model coder` / `qwen`              — swap TEXT to qwen-coder-abliterate (uncensored)
+`!model text <name>`                 — explicit text swap (same as above)
+`!model vision vl` / `light`         — swap VISION to qwen2.5vl:3b (light, fast)
+`!model vision heavy` / `abliterated-vl` — swap VISION to abliterated 7B (max detail)
+`!model vision moondream`            — swap VISION to moondream:1.8b (tiny)
+`!model <text|vision> <full-name>`   — swap to any installed ollama model
+Only ONE model per lane active at a time — old one unloaded before new one warms.
+Next chat msg / image upload cold-loads (~10-30s); subsequent fast.
 
 **Other:**
 `!help` / `!commands`      — this reference
@@ -1319,8 +1556,10 @@ def _has_images(messages):
 
 
 def _pick_model(messages):
-    """Vision model when images are present, otherwise the default coder model."""
-    return VISION_MODEL_NAME if _has_images(messages) else MODEL_NAME
+    """Vision model when images are present, otherwise active text model.
+    Uses _active_models dict so !model command can swap text model at runtime
+    without bot restart."""
+    return _active_models["vision"] if _has_images(messages) else _active_models["text"]
 
 
 def _pick_system_prompt(messages):
@@ -1961,41 +2200,559 @@ async def on_message(message):
             )
         return
 
-    if is_whitelisted(message.author) and is_sitrep_command(message.content):
-        log.info(f"[!SITREP] {message.author.name}")
-        # Run both probes concurrently to minimize latency
-        ollama_task = asyncio.create_task(_ollama_ps())
-        comfy_task = asyncio.create_task(_comfy_status())
-        ollama_info = await ollama_task
-        comfy_running = await comfy_task
-        comfy_icon = "✅" if comfy_running else "❌"
-        comfy_state = "running" if comfy_running else "stopped"
-        port = urlparse(COMFY_HOST).port or 8000
-        # Build combined sitrep
-        report = (
-            f"🛰 **SITREP**\n"
-            f"\n"
-            f"{ollama_info}\n"
-            f"\n"
-            f"🎨 **ComfyUI:** {comfy_icon} {comfy_state} *(port {port})*"
+    if is_whitelisted(message.author) and is_model_command(message.content):
+        _, args = _is_phrase_prefix(message.content, MODEL_PHRASES)
+        log.info(f"[!MODEL] {message.author.name} -> {args!r}")
+
+        # Parse lane + target. Forms:
+        #   !model                       → show both lanes + presets
+        #   !model <name>                → swap TEXT (backwards compat)
+        #   !model text <name>           → swap TEXT (explicit)
+        #   !model vision <name>         → swap VISION
+        lane = "text"
+        target = ""
+        if args:
+            parts = args.split(None, 1)
+            first = parts[0].lower()
+            if first in ("text", "vision") and len(parts) > 1:
+                lane = first
+                target = parts[1].strip()
+            else:
+                lane = "text"
+                target = args.strip()
+
+        current = _active_models[lane]
+
+        # No target → show state + presets w descriptors for BOTH lanes
+        if not target:
+            def render_lane(lane_name):
+                """Group aliases by their resolved model name + show description."""
+                # Build dict: full_name -> [aliases pointing to it]
+                grouped = {}
+                for alias, full in MODEL_PRESETS[lane_name].items():
+                    grouped.setdefault(full, []).append(alias)
+                lines = []
+                for full, aliases in grouped.items():
+                    alias_str = " / ".join(f"`{a}`" for a in aliases)
+                    desc = MODEL_DESCRIPTIONS.get(full, "no description")
+                    lines.append(f"  {alias_str} → `{full}`\n      ↳ *{desc}*")
+                return "\n".join(lines)
+
+            msg = (
+                f"🧠 **Active text:** `{_active_models['text']}`\n"
+                f"👁️ **Active vision:** `{_active_models['vision']}`\n"
+                f"\n"
+                f"━━━ **Swap text:** `!model <preset>` *(or `!model text <preset>`)* ━━━\n"
+                f"{render_lane('text')}\n"
+                f"\n"
+                f"━━━ **Swap vision:** `!model vision <preset>` ━━━\n"
+                f"{render_lane('vision')}\n"
+                f"\n"
+                f"*u can also pass any full model name from `!ollama list`*"
+            )
+            # Split if too long (Discord 2000-char cap)
+            if len(msg) <= 1990:
+                await message.channel.send(msg)
+            else:
+                # Split on lane divider
+                split_idx = msg.find("━━━ **Swap vision:")
+                if split_idx > 0:
+                    await message.channel.send(msg[:split_idx])
+                    await message.channel.send(msg[split_idx:])
+                else:
+                    await message.channel.send(msg[:1990])
+            return
+
+        # Resolve alias → full name within the chosen lane
+        requested = target.lower()
+        new_model = MODEL_PRESETS[lane].get(requested, target)
+        if new_model == current:
+            await message.channel.send(f"{'🧠' if lane == 'text' else '👁️'} Already on `{current}` for {lane} lane")
+            return
+
+        lane_icon = "🧠" if lane == "text" else "👁️"
+        lane_label = lane.upper()
+        placeholder = await message.channel.send(
+            f"⏳ swapping {lane_label} model: `{current.split('/')[-1]}` → `{new_model.split('/')[-1]}`..."
         )
+        # Unload the previous model in this lane to free RAM
+        unload_result = await _ollama_unload(current)
+        _active_models[lane] = new_model
+        log.info(f"[!MODEL] {lane} model swap: {current} → {new_model}")
+        next_action = (
+            "next chat msg will cold-load the new model" if lane == "text"
+            else "next image upload / !see / [VISION]: will cold-load the new vision model"
+        )
+        await placeholder.edit(content=(
+            f"{lane_icon} **{lane_label} model swapped:**\n"
+            f"  • Was: `{current}`\n"
+            f"  • Now: `{new_model}`\n"
+            f"  • Unload: {unload_result.strip()}\n"
+            f"\n*{next_action} (~10-30s first call)*"
+        ))
+        return
+
+    if is_whitelisted(message.author) and is_save_command(message.content):
+        _, args = _is_phrase_prefix(message.content, SAVE_PROMPT_PHRASES)
+        if not args:
+            await message.channel.send(
+                "*[usage: `!save <name>` — bakes recent bot reply as a custom Ollama persona model]*\n"
+                "**3 ways to source the prompt:**\n"
+                "  1. Just `!save <name>` → uses bot's most recent reply in this channel\n"
+                "  2. **Reply** to a specific bot message + `!save <name>` → uses THAT message's content\n"
+                "  3. `!save <name>\\n<paste text here>` → inline content on second line"
+            )
+            return
+        # Parse: !save <name>  OR  !save <name>\n<inline text>
+        first_line, _, inline_rest = args.partition("\n")
+        parts = first_line.strip().split(None, 1)
+        new_name = parts[0].strip().lower().replace(" ", "-")
+        # Hint after name (e.g. "!save my-bot some optional brief") gets ignored — we use source priority
+        if not re.match(r"^[a-z0-9_\-:.]+$", new_name):
+            await message.channel.send(f"*[invalid model name `{new_name}` — use [a-z0-9_-:.]+]*")
+            return
+
+        # ============================================================
+        # Determine source priority (Pattern A vs B vs C)
+        # ============================================================
+        source_text = None
+        source_label = None
+
+        # PATTERN C: inline text on second line
+        if inline_rest and inline_rest.strip() and len(inline_rest.strip()) >= 50:
+            source_text = inline_rest.strip()
+            source_label = "inline content (Pattern C)"
+
+        # PATTERN B: replied to a specific message via Discord reply feature
+        elif message.reference is not None and message.reference.message_id:
+            try:
+                ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                if ref_msg and ref_msg.content.strip():
+                    source_text = ref_msg.content.strip()
+                    source_label = f"reply to {ref_msg.author.display_name}'s message (Pattern B)"
+            except Exception:
+                log.warning(f"[!SAVE] couldn't fetch replied-to message: {message.reference.message_id}")
+
+        # PATTERN A: bot's most recent SUBSTANTIVE reply
+        if source_text is None:
+            try:
+                # Look back through recent history
+                emoji_prefixes = ("⌛", "🎨", "👁️", "📂", "📄", "📎", "🛰", "🧠", "🧬", "❄️", "⏳", "▶", "⏹", "🔄", "✅", "❌", "♻️", "📭", "📜", "🔍", "🌆", "*[")
+                async for msg in message.channel.history(limit=30, before=message):
+                    if msg.author == bot.user and msg.content.strip():
+                        # Skip status/placeholder/announce messages
+                        stripped = msg.content.strip()
+                        if not stripped.startswith(emoji_prefixes) and len(stripped) >= 100:
+                            source_text = stripped
+                            source_label = f"bot's recent reply (Pattern A, {len(stripped)} chars)"
+                            break
+            except Exception as exc:
+                log.warning(f"[!SAVE] history scan failed: {exc}")
+
+        if not source_text:
+            await message.channel.send(
+                "*[!save: couldn't find a source prompt. either reply to a specific bot msg, paste inline on a new line, "
+                "or ensure the bot has posted a recent substantive reply in this channel.]*"
+            )
+            return
+
+        # Validate length sanity
+        if len(source_text) < 50:
+            await message.channel.send(
+                f"*[!save: source text too short ({len(source_text)} chars). need at least 50 chars to bake a useful persona.]*"
+            )
+            return
+
+        log.info(f"[!SAVE] {message.author.name} -> name={new_name} source={source_label} chars={len(source_text)}")
+
+        base = _active_models["text"]
+        start_time = time.monotonic()
+        placeholder = await message.channel.send(
+            f"💾 **Baking saved prompt as `{new_name}`**\n"
+            f"  • Source: {source_label}\n"
+            f"  • Length: {len(source_text):,} chars\n"
+            f"  • Base: `{base.split('/')[-1]}`\n"
+            f"*writing Modelfile + `ollama create`...*"
+        )
+
+        # Build Modelfile
+        from pathlib import Path as _Path
+        script_dir = _Path(__file__).parent
+        modelfile_path = script_dir / f"Modelfile.{new_name}"
+        prompt_safe = source_text.replace('"""', '\\"\\"\\"')
+        modelfile_content = (
+            f"# Auto-generated by !save command\n"
+            f"# Source: {source_label}\n"
+            f"# Base: {base}\n"
+            f"# Saved at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"# Saved by: {message.author.name}\n"
+            f"\n"
+            f"FROM {base}\n"
+            f"\n"
+            f'SYSTEM """{prompt_safe}"""\n'
+            f"\n"
+            f"PARAMETER temperature 0.8\n"
+            f"PARAMETER top_p 0.9\n"
+            f"PARAMETER num_ctx 4096\n"
+            f"PARAMETER repeat_penalty 1.1\n"
+        )
+        try:
+            modelfile_path.write_text(modelfile_content, encoding="utf-8")
+        except Exception as exc:
+            await placeholder.edit(content=f"❌ *[Modelfile write failed: {exc}]*")
+            return
+
+        # Build via ollama create subprocess
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ollama", "create", new_name, "-f", str(modelfile_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+            if proc.returncode != 0:
+                err = stderr.decode("utf-8", errors="replace")[:300]
+                await placeholder.edit(content=f"❌ *[ollama create failed: {err}]*")
+                return
+        except Exception as exc:
+            log.exception("[!SAVE] ollama create failed")
+            await placeholder.edit(content=f"❌ *[ollama create error: {type(exc).__name__}: {exc}]*")
+            return
+
+        total = int(time.monotonic() - start_time)
+        await placeholder.edit(content=(
+            f"💾 **Saved + baked `{new_name}` ✅** *(total {total}s)*\n"
+            f"  • Source: {source_label}\n"
+            f"  • Base: `{base}`\n"
+            f"  • Modelfile: `{modelfile_path.name}`\n"
+            f"  • Prompt: {len(source_text):,} chars (attached below)\n"
+            f"\n"
+            f"swap to it: `!model {new_name}`"
+        ))
+        # Attach saved prompt for review
+        try:
+            buf = io.BytesIO(source_text.encode("utf-8"))
+            await message.channel.send(
+                content=f"📜 *full prompt saved as `{new_name}`:*",
+                file=discord.File(buf, filename=f"persona_{new_name}.txt"),
+            )
+        except Exception:
+            log.exception("[!SAVE] attachment failed")
+        return
+
+    if is_whitelisted(message.author) and is_persona_command(message.content):
+        _, args = _is_phrase_prefix(message.content, PERSONA_PHRASES)
+        if not args:
+            await message.channel.send(
+                "*[usage: `!persona <name> <brief>`]*\n"
+                "*example: `!persona crude-bot vulgar profane bartender who insults everyone but is secretly helpful`*\n"
+                "*builder model: abliterated qwen-coder (writes uncensored). new model uses current active text as base.*"
+            )
+            return
+        parts = args.split(None, 1)
+        if len(parts) < 2:
+            await message.channel.send(
+                "*[!persona: need both name AND brief. e.g. `!persona crude-bot rude vulgar...`]*"
+            )
+            return
+        new_name = parts[0].strip().lower().replace(" ", "-")
+        brief = parts[1].strip()
+        if not re.match(r"^[a-z0-9_\-:.]+$", new_name):
+            await message.channel.send(f"*[invalid model name `{new_name}` — use [a-z0-9_-:.]+]*")
+            return
+
+        base = _active_models["text"]  # base model for new persona = current active text
+        builder = PERSONA_BUILDER_MODEL  # who writes the persona text (abliterated)
+        log.info(f"[!PERSONA] {message.author.name} -> name={new_name} base={base} builder={builder} brief={brief[:80]!r}")
+
+        start_time = time.monotonic()
+        header = (
+            f"🧬 **Building persona `{new_name}`**\n"
+            f"  • Brief: `{brief[:120]}`\n"
+            f"  • Builder: `{builder.split('/')[-1]}` *(abliterated for creative freedom)*\n"
+            f"  • Base: `{base.split('/')[-1]}`\n"
+        )
+        placeholder = await message.channel.send(header + "\n*composing persona text via builder model...* ▌")
+
+        # Live-streaming callback so operator can watch persona compose
+        async def on_token(accumulated):
+            elapsed = int(time.monotonic() - start_time)
+            preview = accumulated if len(accumulated) <= 1200 else accumulated[:1200] + "…"
+            try:
+                await placeholder.edit(
+                    content=f"{header}\n*composing... {elapsed}s* ▌\n\n```\n{preview}\n```"
+                )
+            except discord.HTTPException:
+                pass
+
+        # Generate persona text via builder model
+        try:
+            persona_text = await _generate_persona_text(brief, builder, on_token=on_token)
+        except Exception as exc:
+            log.exception("[!PERSONA] generation failed")
+            await placeholder.edit(content=f"❌ *[persona text generation failed: {type(exc).__name__}: {exc}]*")
+            return
+
+        if not persona_text or len(persona_text) < 50:
+            await placeholder.edit(content=f"❌ *[generated persona too short ({len(persona_text)} chars) — model probably returned junk]*")
+            return
+
+        # Build Modelfile
+        from pathlib import Path as _Path
+        script_dir = _Path(__file__).parent
+        modelfile_path = script_dir / f"Modelfile.{new_name}"
+        prompt_safe = persona_text.replace('"""', '\\"\\"\\"')
+        modelfile_content = (
+            f"# Auto-generated by !persona command\n"
+            f"# Base: {base}\n"
+            f"# Builder: {builder}\n"
+            f"# Brief: {brief}\n"
+            f"# Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"\n"
+            f"FROM {base}\n"
+            f"\n"
+            f'SYSTEM """{prompt_safe}"""\n'
+            f"\n"
+            f"PARAMETER temperature 0.9\n"
+            f"PARAMETER top_p 0.92\n"
+            f"PARAMETER num_ctx 4096\n"
+            f"PARAMETER repeat_penalty 1.1\n"
+        )
+        try:
+            modelfile_path.write_text(modelfile_content, encoding="utf-8")
+        except Exception as exc:
+            await placeholder.edit(content=f"❌ *[Modelfile write failed: {exc}]*")
+            return
+
+        elapsed = int(time.monotonic() - start_time)
+        await placeholder.edit(content=(
+            f"{header}\n"
+            f"✅ composed in {elapsed}s ({len(persona_text):,} chars) — now baking via `ollama create`..."
+        ))
+
+        # Run ollama create subprocess
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ollama", "create", new_name, "-f", str(modelfile_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+            if proc.returncode != 0:
+                err = stderr.decode("utf-8", errors="replace")[:300]
+                await placeholder.edit(content=f"❌ *[ollama create failed: {err}]*")
+                return
+        except Exception as exc:
+            log.exception("[!PERSONA] ollama build failed")
+            await placeholder.edit(content=f"❌ *[ollama create error: {type(exc).__name__}: {exc}]*")
+            return
+
+        total_elapsed = int(time.monotonic() - start_time)
+        # Final message — attach full persona as .txt for review
+        await placeholder.edit(content=(
+            f"🧬 **Persona `{new_name}` built ✅** *(total {total_elapsed}s)*\n"
+            f"  • Base: `{base}`\n"
+            f"  • Built by: `{builder.split('/')[-1]}` *(abliterated)*\n"
+            f"  • Modelfile: `{modelfile_path.name}`\n"
+            f"  • Brief: `{brief[:120]}`\n"
+            f"  • Prompt: {len(persona_text):,} chars *(full text attached below)*\n"
+            f"\n"
+            f"swap to it: `!model {new_name}`"
+        ))
+        # Attach full persona text for review
+        try:
+            buf = io.BytesIO(persona_text.encode("utf-8"))
+            await message.channel.send(
+                content=f"📜 *full persona text for `{new_name}` (review before going live):*",
+                file=discord.File(buf, filename=f"persona_{new_name}.txt"),
+            )
+        except Exception:
+            log.exception("[!PERSONA] attachment failed")
+        return
+
+    if is_whitelisted(message.author) and is_freeze_command(message.content):
+        _, args = _is_phrase_prefix(message.content, FREEZE_PHRASES)
+        # Parse: !freeze [new-name] [--base <model>]
+        # If no name: auto-generate timestamped name from active text model
+        base = _active_models["text"]
+        new_name = None
+        if args:
+            parts = args.strip().split()
+            # Optional --base override
+            if "--base" in parts:
+                idx = parts.index("--base")
+                if idx + 1 < len(parts):
+                    base = parts[idx + 1]
+                    parts = parts[:idx] + parts[idx + 2:]
+            if parts:
+                new_name = " ".join(parts).strip().lower().replace(" ", "-")
+        if not new_name:
+            clean_base = base.split("/")[-1].split(":")[0]
+            new_name = f"{clean_base}-frozen-{int(time.time())}"
+        # Validate name (ollama-compatible + shell-safe)
+        if not re.match(r"^[a-z0-9_\-:.]+$", new_name):
+            await message.channel.send(
+                f"*[!freeze: invalid model name `{new_name}` — use [a-z0-9_-:.]+ only]*"
+            )
+            return
+
+        log.info(f"[!FREEZE] {message.author.name} -> name={new_name!r} base={base!r}")
+        prompt_text = _get_live_system_prompt()
+        if not prompt_text.strip():
+            await message.channel.send("*[!freeze: system_prompt.txt is empty — nothing to freeze]*")
+            return
+
+        placeholder = await message.channel.send(
+            f"❄️ **Freezing persona...**\n"
+            f"  • Base: `{base}`\n"
+            f"  • New model: `{new_name}`\n"
+            f"  • Prompt chars: {len(prompt_text):,}\n"
+            f"*writing Modelfile + running `ollama create` (may take 10-30s)...*"
+        )
+
+        # Build Modelfile content. Escape triple-quotes in prompt to avoid breaking SYSTEM block.
+        prompt_safe = prompt_text.replace('"""', '\\"\\"\\"')
+        from pathlib import Path as _Path
+        script_dir = _Path(__file__).parent
+        modelfile_path = script_dir / f"Modelfile.{new_name}"
+        modelfile_content = (
+            f"# Auto-generated by !freeze command in Discord — do not edit by hand.\n"
+            f"# Base: {base}\n"
+            f"# Frozen at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"# Prompt chars: {len(prompt_text)}\n"
+            f"\n"
+            f"FROM {base}\n"
+            f"\n"
+            f'SYSTEM """{prompt_safe}"""\n'
+            f"\n"
+            f"PARAMETER temperature 0.8\n"
+            f"PARAMETER top_p 0.9\n"
+            f"PARAMETER num_ctx 4096\n"
+            f"PARAMETER repeat_penalty 1.1\n"
+            f"PARAMETER stop \"[STOPPED\"\n"
+        )
+        try:
+            modelfile_path.write_text(modelfile_content, encoding="utf-8")
+        except Exception as exc:
+            await placeholder.edit(content=f"❌ *[!freeze: failed to write Modelfile: {exc}]*")
+            return
+
+        # Run ollama create as a subprocess
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ollama", "create", new_name, "-f", str(modelfile_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+            stdout_text = stdout.decode("utf-8", errors="replace")[:600]
+            stderr_text = stderr.decode("utf-8", errors="replace")[:600]
+            if proc.returncode != 0:
+                await placeholder.edit(content=(
+                    f"❌ **Freeze failed.**\n"
+                    f"  • exit code: {proc.returncode}\n"
+                    f"  • stderr: ```\n{stderr_text}\n```"
+                ))
+                return
+        except asyncio.TimeoutError:
+            await placeholder.edit(content=f"❌ *[!freeze: timed out after 180s — check `ollama list` manually]*")
+            return
+        except FileNotFoundError:
+            await placeholder.edit(content=f"❌ *[!freeze: `ollama` command not found in PATH]*")
+            return
+        except Exception as exc:
+            await placeholder.edit(content=f"❌ *[!freeze: {type(exc).__name__}: {exc}]*")
+            log.exception("[!FREEZE] unexpected failure")
+            return
+
+        await placeholder.edit(content=(
+            f"❄️ **Persona frozen as `{new_name}`** ✅\n"
+            f"  • Base: `{base}`\n"
+            f"  • Modelfile: `{modelfile_path.name}`\n"
+            f"  • Prompt baked: {len(prompt_text):,} chars\n"
+            f"\n"
+            f"**Use it:**\n"
+            f"  • Discord: `!model {new_name}` to swap\n"
+            f"  • .env: `MODEL_NAME={new_name}` to set as default\n"
+            f"  • Verify: `!ollama list` (look for `{new_name}`)"
+        ))
+        return
+
+    if is_whitelisted(message.author) and is_sitrep_command(message.content):
+        _, args = _is_phrase_prefix(message.content, SITREP_PHRASES)
+        sub = (args or "").strip().lower().split(None, 1)[0] if (args or "").strip() else ""
+        log.info(f"[!SITREP] {message.author.name} sub={sub!r}")
+        chan_id = message.channel.id
+
+        # ON: spawn live dashboard
+        if sub in ("on", "live", "start", "toggle"):
+            # If already running, swap to a fresh message (avoids stale dead messages)
+            existing = _sitrep_live.get(chan_id)
+            if existing:
+                existing.get("task", None) and existing["task"].cancel()
+                try:
+                    await existing["message"].edit(content=existing["message"].content + "\n\n*[restarted]*")
+                except Exception:
+                    pass
+            initial_report = await _render_sitrep(live_marker=True)
+            new_msg = await message.channel.send(initial_report[:1990])
+            task = asyncio.create_task(_sitrep_live_loop(chan_id, new_msg))
+            _sitrep_live[chan_id] = {"task": task, "message": new_msg}
+            return
+
+        # OFF: cancel the live loop in this channel
+        if sub in ("off", "stop", "kill", "end"):
+            existing = _sitrep_live.pop(chan_id, None)
+            if existing and existing.get("task"):
+                existing["task"].cancel()
+                await message.channel.send("🛰 *[live sitrep stopped]*")
+            else:
+                await message.channel.send("*[no live sitrep running in this channel]*")
+            return
+
+        # STATUS: is live mode on in this channel?
+        if sub in ("status", "is-on", "?"):
+            existing = _sitrep_live.get(chan_id)
+            if existing and existing.get("task") and not existing["task"].done():
+                await message.channel.send(
+                    f"🛰 live sitrep **ON** in this channel — updates every {SITREP_LIVE_INTERVAL}s"
+                )
+            else:
+                await message.channel.send("🛰 live sitrep is off in this channel")
+            return
+
+        # No subcommand → one-shot snapshot (existing behavior)
+        report = await _render_sitrep(live_marker=False)
         await message.channel.send(report[:1990])
         return
 
     if is_whitelisted(message.author) and is_help_command(message.content):
-        log.info(f"[!HELP] {message.author.name}")
-        # Discord 2000-char limit — split COMMAND_REFERENCE if needed
+        log.info(f"[!HELP] {message.author.name}, ref={len(COMMAND_REFERENCE)} chars")
+        # Discord 2000-char limit per msg. Split COMMAND_REFERENCE into chunks
+        # of ≤1900 chars, preferring section boundaries (double newline).
         ref = COMMAND_REFERENCE
-        if len(ref) <= 1990:
-            await message.channel.send(ref)
-        else:
-            # Split on a section divider (double newline) closest to midpoint
-            mid = len(ref) // 2
-            split_at = ref.rfind("\n\n", 0, mid + 500)
-            if split_at < 100:
-                split_at = mid
-            await message.channel.send(ref[:split_at])
-            await message.channel.send(ref[split_at:].lstrip())
+        CHUNK_MAX = 1900
+        chunks = []
+        remaining = ref
+        while remaining:
+            if len(remaining) <= CHUNK_MAX:
+                chunks.append(remaining)
+                break
+            # Find best split point — prefer double newline, then single newline
+            split_at = remaining.rfind("\n\n", 0, CHUNK_MAX)
+            if split_at < CHUNK_MAX // 2:
+                split_at = remaining.rfind("\n", 0, CHUNK_MAX)
+            if split_at < CHUNK_MAX // 2:
+                split_at = CHUNK_MAX
+            chunks.append(remaining[:split_at])
+            remaining = remaining[split_at:].lstrip()
+        log.info(f"[!HELP] split into {len(chunks)} messages")
+        for i, chunk in enumerate(chunks):
+            try:
+                await message.channel.send(chunk)
+            except Exception as exc:
+                log.exception(f"[!HELP] failed to send chunk {i+1}/{len(chunks)}: {exc}")
+                break
         return
 
     # AUTH handler: list whitelisted operators (whitelist-only, no LLM)
