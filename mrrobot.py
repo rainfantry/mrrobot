@@ -707,37 +707,58 @@ async def _comfy_status():
 
 
 async def _comfy_stop():
-    """Kill ComfyUI completely — both the Electron wrapper (ComfyUI.exe) AND
-    any process listening on COMFY_HOST's port. The /T flag kills child
-    processes too, so the bundled Python server gets cleaned up alongside
-    its Electron parent. Without this, a partial-stop leaves the wrapper
-    alive + blocks fresh `!comfy start`."""
+    """Aggressively kill ComfyUI Desktop + everything it spawned.
+
+    ComfyUI Desktop is an Electron app — it has multiple helper processes
+    (renderer, GPU, extension host) + a child Python server. A simple
+    `taskkill /IM ComfyUI.exe` misses helpers and the watchdog respawns
+    them. This nukes:
+      1. All processes with name matching ComfyUI* (main + helpers)
+      2. All processes named electron* (Electron runtime if separate)
+      3. python.exe whose command-line references ComfyUI/main.py (the server)
+      4. Anything STILL listening on the COMFY port (belt-and-suspenders)
+    """
     port = urlparse(COMFY_HOST).port or 8000
     killed_summary = []
 
-    # Step 1: Nuke ComfyUI.exe (Electron wrapper) AND its children (/T flag).
-    # This catches the Python server too if it was spawned as a child.
+    # Step 1: All ComfyUI* processes (main + helpers + renderer + GPU)
     try:
         kp = await asyncio.create_subprocess_exec(
-            "taskkill", "/F", "/T", "/IM", "ComfyUI.exe",
+            "powershell", "-NoProfile", "-Command",
+            "Get-Process | Where-Object {$_.Name -like 'ComfyUI*'} | "
+            "ForEach-Object { try { Stop-Process -Force -Id $_.Id -ErrorAction Stop; "
+            "\"killed $($_.Name) PID $($_.Id)\" } catch { } }",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(kp.communicate(), timeout=10)
-        out = stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")
-        if kp.returncode == 0:
-            # taskkill prints SUCCESS lines for each PID killed
-            n_killed = out.count("SUCCESS")
-            killed_summary.append(f"ComfyUI.exe x{n_killed} (with children via /T)")
-        elif "not found" in out.lower() or "no tasks" in out.lower():
-            pass  # wrapper wasn't running, that's fine
-        else:
-            killed_summary.append(f"ComfyUI.exe taskkill returned {kp.returncode}: {out[:80].strip()}")
+        stdout, _ = await asyncio.wait_for(kp.communicate(), timeout=15)
+        for line in stdout.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line.startswith("killed"):
+                killed_summary.append(line)
     except Exception as exc:
-        killed_summary.append(f"ComfyUI.exe kill failed: {exc}")
+        killed_summary.append(f"ComfyUI* scan failed: {exc}")
 
-    # Step 2: Belt-and-suspenders — anything STILL listening on the port?
-    # Catches edge cases (manually-launched python, different parent process)
+    # Step 2: python.exe whose CLI references ComfyUI/main.py
+    try:
+        kp = await asyncio.create_subprocess_exec(
+            "powershell", "-NoProfile", "-Command",
+            "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and "
+            "$_.CommandLine -like '*ComfyUI*main.py*' } | ForEach-Object { "
+            "try { Stop-Process -Force -Id $_.ProcessId -ErrorAction Stop; "
+            "\"killed python PID $($_.ProcessId) (ComfyUI server)\" } catch { } }",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(kp.communicate(), timeout=15)
+        for line in stdout.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line.startswith("killed"):
+                killed_summary.append(line)
+    except Exception as exc:
+        killed_summary.append(f"python-CLI scan failed: {exc}")
+
+    # Step 3: Belt-and-suspenders — anything STILL listening on the port?
     try:
         proc = await asyncio.create_subprocess_exec(
             "powershell", "-NoProfile", "-Command",
@@ -760,7 +781,7 @@ async def _comfy_stop():
         killed_summary.append(f"port-scan kill failed: {exc}")
 
     if not killed_summary:
-        return f"nothing found (no ComfyUI.exe, no listener on port {port}) — was already stopped?"
+        return f"nothing found running for ComfyUI (no ComfyUI*.exe, no python /main.py, no port {port} listener)"
     return "killed: " + " | ".join(killed_summary)
 
 
