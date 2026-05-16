@@ -2,38 +2,28 @@
   "1": {
     "class_type": "CheckpointLoaderSimple",
     "inputs": {
-      "ckpt_name": "sianSdxlV1.safetensors"
-    }
-  },
-  "2": {
-    "class_type": "LoraLoader",
-    "inputs": {
-      "lora_name": "sks_woman_lora_v3.safetensors",
-      "strength_model": 0.9,
-      "strength_clip": 0.9,
-      "model": ["1", 0],
-      "clip": ["1", 1]
+      "ckpt_name": "Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors"
     }
   },
   "3": {
     "class_type": "CLIPTextEncode",
     "inputs": {
       "text": "PLACEHOLDER_POSITIVE_PROMPT_INJECTED_AT_RUNTIME",
-      "clip": ["2", 1]
+      "clip": ["1", 1]
     }
   },
   "4": {
     "class_type": "CLIPTextEncode",
     "inputs": {
-      "text": "blurry, deformed, ugly, bad anatomy, low quality, plastic skin, stray hairs, peach fuzz, oversharpened, weird textures, cartoon, anime, 3d render, blonde hair, green eyes, watermark, text, signature",
-      "clip": ["2", 1]
+      "text": "blurry, deformed, low quality, oversharpened, weird textures, watermark, text, signature, jpeg artifacts, oversaturated, bad composition, bad anatomy, extra fingers, fused fingers, missing limbs",
+      "clip": ["1", 1]
     }
   },
   "5": {
     "class_type": "EmptyLatentImage",
     "inputs": {
-      "width": 832,
-      "height": 1216,
+      "width": 1024,
+      "height": 1024,
       "batch_size": 1
     }
   },
@@ -41,12 +31,12 @@
     "class_type": "KSampler",
     "inputs": {
       "seed": 0,
-      "steps": 35,
-      "cfg": 5.0,
-      "sampler_name": "dpmpp_3m_sde",
+      "steps": 30,
+      "cfg": 6.0,
+      "sampler_name": "dpmpp_2m_sde",
       "scheduler": "karras",
       "denoise": 1.0,
-      "model": ["2", 0],
+      "model": ["1", 0],
       "positive": ["3", 0],
       "negative": ["4", 0],
       "latent_image": ["5", 0]
@@ -62,7 +52,7 @@
   "8": {
     "class_type": "SaveImage",
     "inputs": {
-      "filename_prefix": "servitor_gen",
+      "filename_prefix": "agent_gen",
       "images": ["7", 0]
     }
   }

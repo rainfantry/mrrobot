@@ -14,6 +14,8 @@ import time
 import base64
 import asyncio
 import logging
+import subprocess
+from urllib.parse import urlparse
 from collections import defaultdict, deque
 
 import aiohttp
@@ -89,6 +91,35 @@ GENERATE_ENABLED   = os.getenv("GENERATE_ENABLED", "true").lower() in ("true", "
 #   "0"  -> hard disable (any positive emission rejected)
 _gml_raw = os.getenv("GENERATE_MAX_LOOPS", "2").lower().strip()
 GENERATE_MAX_LOOPS = None if _gml_raw in ("-1", "none", "unlimited", "infinite") else int(_gml_raw)
+
+# === Agentic tools — [LIST] / [READ] / [ATTACH] sentinels (read-only Level 1) ===
+# Bot LLM can emit these to inspect ur filesystem within an allowlist.
+# Allowlist = paths the LLM can touch. Blocklist = paths explicitly forbidden
+# even if they're inside an allowed subtree (e.g. .ssh, AppData).
+TOOL_ENABLED         = os.getenv("TOOL_ENABLED", "true").lower() in ("true", "1", "yes", "on")
+TOOL_MAX_LOOPS       = int(os.getenv("TOOL_MAX_LOOPS", "8"))
+TOOL_READ_MAX_BYTES  = int(os.getenv("TOOL_READ_MAX_BYTES", "50000"))   # 50KB cap per [READ]
+TOOL_ATTACH_MAX_MB   = int(os.getenv("TOOL_ATTACH_MAX_MB", "25"))       # 25MB Discord cap
+TOOL_ALLOWLIST = [p.strip().replace("\\", "/") for p in os.getenv(
+    "TOOL_ALLOWLIST",
+    "C:/Users/gwu07/Desktop,"
+    "C:/Users/gwu07/Documents,"
+    "C:/Users/gwu07/Downloads,"
+    "C:/Users/gwu07/discordagent,"
+    "C:/Users/gwu07/mrrobot,"
+    "C:/Users/gwu07/machine-spirit"
+).split(",") if p.strip()]
+TOOL_BLOCKLIST = [p.strip().replace("\\", "/") for p in os.getenv(
+    "TOOL_BLOCKLIST",
+    "C:/Users/gwu07/.ssh,"
+    "C:/Users/gwu07/.aws,"
+    "C:/Users/gwu07/.gnupg,"
+    "C:/Users/gwu07/AppData,"
+    "C:/Windows,"
+    "C:/ProgramData,"
+    "C:/Program Files,"
+    "C:/Program Files (x86)"
+).split(",") if p.strip()]
 
 # Anthropic vision bridge. When VISION_MODEL_NAME starts with "anthropic:",
 # image-bearing requests route to the Anthropic API instead of local Ollama.
@@ -280,6 +311,32 @@ def _load_system_prompt():
 
 SYSTEM_PROMPT = _load_system_prompt()
 
+
+# Hot-reload cache: re-reads system_prompt.txt automatically when its mtime
+# changes. Edit the .txt file + save = next message picks up the new prompt
+# without restarting the bot. Zero I/O cost between edits — only stat() check.
+_PROMPT_CACHE = {
+    "mtime": os.path.getmtime(_PROMPT_FILE) if os.path.exists(_PROMPT_FILE) else 0.0,
+    "content": SYSTEM_PROMPT,
+}
+
+
+def _get_live_system_prompt():
+    """Returns current system prompt content, hot-reloading from disk on mtime
+    change. Use this instead of the static SYSTEM_PROMPT constant for any
+    runtime path that should respect live edits to system_prompt.txt."""
+    try:
+        mtime = os.path.getmtime(_PROMPT_FILE)
+    except OSError:
+        return _PROMPT_CACHE["content"] or SYSTEM_PROMPT_BASELINE
+    if mtime != _PROMPT_CACHE["mtime"]:
+        new_content = _load_system_prompt()
+        if new_content != _PROMPT_CACHE["content"]:
+            log.info(f"[PROMPT] hot-reloaded — {len(new_content)} chars (mtime changed)")
+        _PROMPT_CACHE["mtime"] = mtime
+        _PROMPT_CACHE["content"] = new_content
+    return _PROMPT_CACHE["content"]
+
 # Minimal system prompt for vision calls. Small vision models (moondream:1.8b,
 # llava-phi3:3.8b) get confused by the full persona prompt and return garbage
 # ("?'" or empty). This prompt is direct and instructs the model to describe
@@ -304,8 +361,46 @@ skip_streams = set()  # channel_ids whose current cancel was a !skip (delete vs 
 STOP_PHRASES = ("stfu", "shut up", "shutup", "shut the fuck up", "!stop", "!kill")
 SKIP_PHRASES = ("!skip", "skip", "next")
 ARGUE_PHRASES = ("!argue", "/argue")
-GEN_PHRASES   = ("!gen", "/gen")
-SCENE_PHRASES = ("!scene", "/scene")
+GEN_PHRASES    = ("!gen", "/gen")
+SCENE_PHRASES  = ("!scene", "/scene")
+LIST_PHRASES   = ("!list", "/list", "!ls")
+READ_PHRASES   = ("!read", "/read", "!cat")
+ATTACH_PHRASES = ("!attach", "/attach", "!send")
+# Two vision lanes:
+#   !see / !look / !describe  → light model (VISION_MODEL_NAME, default qwen2.5vl:3b)
+#                                ~5-7GB RAM, parallel-safe with ComfyUI + text model
+#   !vision / !v              → heavy model (VISION_HEAVY_MODEL_NAME, abliterated 7B)
+#                                ~10-12GB RAM, max detail + uncensored, swap-in only
+SEE_PHRASES    = ("!see", "/see", "!look", "!describe", "!check")
+VISION_PHRASES = ("!vision", "/vision", "!v")
+SEE_BATCH_PHRASES    = ("!see-batch", "/see-batch", "!batch-see", "!seebatch", "!sb")
+VISION_BATCH_PHRASES = ("!vision-batch", "/vision-batch", "!batch-vision", "!visionbatch", "!vb")
+SEE_BATCH_MAX = int(os.getenv("SEE_BATCH_MAX", "20"))  # cap on images per batch
+COMFY_PHRASES  = ("!comfy", "/comfy")
+OLLAMA_PHRASES = ("!ollama", "/ollama")
+SITREP_PHRASES = ("!sitrep", "/sitrep", "!status", "!sit")
+HELP_PHRASES   = ("!help", "/help", "!commands", "!cheatsheet", "!?")
+
+# Default image path for vision commands when called with no path argument.
+DEFAULT_VISION_PATH = os.getenv("DEFAULT_VISION_PATH", "C:/Users/gwu07/Desktop/vision.png")
+
+# ComfyUI server location — used by !comfy commands to talk to / find the server.
+# Same value as the one comfyui_bridge.py reads. Both files load it independently
+# from the same env var so they stay in sync.
+COMFY_HOST = os.getenv("COMFY_HOST", "http://localhost:8000").rstrip("/")
+
+# ComfyUI launcher path — used by !comfy start to boot the server.
+# Override via .env if u install it elsewhere.
+COMFY_LAUNCH_CMD = os.getenv(
+    "COMFY_LAUNCH_CMD",
+    "C:/Users/gwu07/Desktop/ComfyUi/ComfyUI.exe",
+)
+# Heavy vision model (abliterated, max detail). Used only by !vision command + LLM-emitted
+# [VISION] sentinel. VISION_MODEL_NAME is the lighter default for all other vision paths.
+VISION_HEAVY_MODEL_NAME = os.getenv(
+    "VISION_HEAVY_MODEL_NAME",
+    "huihui_ai/qwen2.5-vl-abliterated:7b",
+)
 
 # Sentinel: matches "[WEBSEARCH]: <query>" terminated by newline OR [STOPPED.
 # Mid-stream: requires a terminator so we don't fire on partial query tokens.
@@ -335,6 +430,24 @@ GENERATE_NAKED_RE = re.compile(
     re.IGNORECASE,
 )
 
+# === Tool sentinels — same family, all single-arg path-based ===
+TOOL_LIST_RE         = re.compile(r"\[LIST\]:\s*([^\n\r]+?)\s*(?:[\n\r]|\[STOPPED)", re.IGNORECASE)
+TOOL_LIST_NAKED_RE   = re.compile(r"\[LIST\]:\s*([^\n\r]+)\s*\Z", re.IGNORECASE)
+TOOL_READ_RE         = re.compile(r"\[READ\]:\s*([^\n\r]+?)\s*(?:[\n\r]|\[STOPPED)", re.IGNORECASE)
+TOOL_READ_NAKED_RE   = re.compile(r"\[READ\]:\s*([^\n\r]+)\s*\Z", re.IGNORECASE)
+TOOL_ATTACH_RE       = re.compile(r"\[ATTACH\]:\s*([^\n\r]+?)\s*(?:[\n\r]|\[STOPPED)", re.IGNORECASE)
+TOOL_ATTACH_NAKED_RE = re.compile(r"\[ATTACH\]:\s*([^\n\r]+)\s*\Z", re.IGNORECASE)
+TOOL_VISION_RE       = re.compile(r"\[VISION\]:\s*([^\n\r]+?)\s*(?:[\n\r]|\[STOPPED)", re.IGNORECASE)
+TOOL_VISION_NAKED_RE = re.compile(r"\[VISION\]:\s*([^\n\r]+)\s*\Z", re.IGNORECASE)
+
+# Tool dispatch table: name -> (mid-stream regex, end-of-stream naked regex)
+TOOL_PATTERNS = {
+    "LIST":   (TOOL_LIST_RE,   TOOL_LIST_NAKED_RE),
+    "READ":   (TOOL_READ_RE,   TOOL_READ_NAKED_RE),
+    "ATTACH": (TOOL_ATTACH_RE, TOOL_ATTACH_NAKED_RE),
+    "VISION": (TOOL_VISION_RE, TOOL_VISION_NAKED_RE),
+}
+
 AUTH_PHRASES = (
     "who has auth", "whos got auth", "who's got auth", "who got auth",
     "whitelist", "show whitelist", "list whitelist",
@@ -344,6 +457,505 @@ SHORTCUT_PHRASES = (
     "shortcuts", "list shortcuts", "show shortcuts", "shortcut list",
     "!shortcuts", "!commands", "!help",
 )
+
+
+# =========================================================================
+# Agentic tool helpers — path validation + [LIST]/[READ]/[ATTACH] handlers
+# =========================================================================
+
+def _normalize_path(path):
+    """Canonical normalised path for comparison. Resolves .. and ., expands ~,
+    forces forward slashes, AND lowercases (Windows is case-insensitive — the
+    LLM emits 'c:/users/...' but the allowlist has 'C:/Users/...'; without
+    lowercasing, startswith() rejects valid paths)."""
+    try:
+        expanded = os.path.expanduser(path)
+        absolute = os.path.abspath(expanded)
+        return absolute.replace("\\", "/").lower()
+    except Exception:
+        return None
+
+
+def _is_path_allowed(path):
+    """Returns (allowed: bool, reason: str|None). Path must (a) resolve cleanly,
+    (b) not match any BLOCKLIST entry as prefix, (c) match an ALLOWLIST entry
+    as prefix. Blocklist trumps allowlist (so .ssh inside Documents is still blocked)."""
+    abs_norm = _normalize_path(path)
+    if abs_norm is None:
+        return False, "could not resolve path"
+    # Blocklist first — short-circuit on match
+    for blocked in TOOL_BLOCKLIST:
+        blocked_norm = _normalize_path(blocked)
+        if blocked_norm and abs_norm.startswith(blocked_norm):
+            return False, f"blocklisted: {blocked}"
+    # Allowlist next — must match one
+    for allowed in TOOL_ALLOWLIST:
+        allowed_norm = _normalize_path(allowed)
+        if allowed_norm and abs_norm.startswith(allowed_norm):
+            return True, None
+    return False, "not in allowlist (set TOOL_ALLOWLIST env to extend)"
+
+
+def _tool_list(path):
+    """[LIST]: handler. Returns directory listing as a system-message string
+    suitable for the LLM to read. Lists files w sizes + dirs marked."""
+    ok, err = _is_path_allowed(path)
+    if not ok:
+        return f"<<<LIST_ERROR>>>\npath: {path}\nerror: {err}\n<<<END>>>"
+    abs_norm = _normalize_path(path)
+    try:
+        if not os.path.exists(abs_norm):
+            return f"<<<LIST_ERROR>>>\npath: {path}\nerror: does not exist\n<<<END>>>"
+        if not os.path.isdir(abs_norm):
+            return f"<<<LIST_ERROR>>>\npath: {path}\nerror: not a directory (use [READ] for files)\n<<<END>>>"
+        entries = sorted(os.listdir(abs_norm), key=lambda e: (not os.path.isdir(os.path.join(abs_norm, e)), e.lower()))
+        lines = [f"<<<LIST>>>", f"path: {abs_norm}", f"count: {len(entries)} entries", ""]
+        for entry in entries:
+            full = os.path.join(abs_norm, entry)
+            try:
+                is_dir = os.path.isdir(full)
+                if is_dir:
+                    lines.append(f"  [DIR]  {entry}/")
+                else:
+                    size = os.path.getsize(full)
+                    lines.append(f"  [FILE] {entry}  ({size:,} bytes)")
+            except OSError:
+                lines.append(f"  [???]  {entry}  (stat failed)")
+        lines.append("<<<END>>>")
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"<<<LIST_ERROR>>>\npath: {path}\nerror: {type(exc).__name__}: {exc}\n<<<END>>>"
+
+
+def _tool_read(path):
+    """[READ]: handler. Returns file contents (up to TOOL_READ_MAX_BYTES) as
+    a system-message string. Truncates large files. Handles binary gracefully."""
+    ok, err = _is_path_allowed(path)
+    if not ok:
+        return f"<<<READ_ERROR>>>\npath: {path}\nerror: {err}\n<<<END>>>"
+    abs_norm = _normalize_path(path)
+    try:
+        if not os.path.exists(abs_norm):
+            return f"<<<READ_ERROR>>>\npath: {path}\nerror: does not exist\n<<<END>>>"
+        if os.path.isdir(abs_norm):
+            return f"<<<READ_ERROR>>>\npath: {path}\nerror: is a directory (use [LIST] instead)\n<<<END>>>"
+        size = os.path.getsize(abs_norm)
+        with open(abs_norm, "rb") as f:
+            raw = f.read(TOOL_READ_MAX_BYTES + 1)
+        truncated = len(raw) > TOOL_READ_MAX_BYTES
+        if truncated:
+            raw = raw[:TOOL_READ_MAX_BYTES]
+        # Decode best-effort
+        try:
+            content = raw.decode("utf-8")
+            decode_note = ""
+        except UnicodeDecodeError:
+            content = raw.decode("utf-8", errors="replace")
+            decode_note = "\n<<<NOTE>>> binary or non-UTF8 — decoded with replacement chars"
+        suffix = f"\n<<<TRUNCATED>>> read {TOOL_READ_MAX_BYTES:,} of {size:,} bytes; set TOOL_READ_MAX_BYTES higher for more" if truncated else ""
+        return f"<<<READ>>>\npath: {abs_norm}\nsize: {size:,} bytes{decode_note}\n---\n{content}\n---{suffix}\n<<<END>>>"
+    except Exception as exc:
+        return f"<<<READ_ERROR>>>\npath: {path}\nerror: {type(exc).__name__}: {exc}\n<<<END>>>"
+
+
+async def _tool_attach(path, channel):
+    """[ATTACH]: handler. Sends file as a Discord attachment, returns
+    confirmation as a system-message string."""
+    ok, err = _is_path_allowed(path)
+    if not ok:
+        return f"<<<ATTACH_ERROR>>>\npath: {path}\nerror: {err}\n<<<END>>>"
+    abs_norm = _normalize_path(path)
+    try:
+        if not os.path.exists(abs_norm):
+            return f"<<<ATTACH_ERROR>>>\npath: {path}\nerror: does not exist\n<<<END>>>"
+        if os.path.isdir(abs_norm):
+            return f"<<<ATTACH_ERROR>>>\npath: {path}\nerror: cannot attach a directory\n<<<END>>>"
+        size = os.path.getsize(abs_norm)
+        max_bytes = TOOL_ATTACH_MAX_MB * 1024 * 1024
+        if size > max_bytes:
+            return f"<<<ATTACH_ERROR>>>\npath: {path}\nerror: file is {size:,} bytes — exceeds Discord {TOOL_ATTACH_MAX_MB}MB limit\n<<<END>>>"
+        filename = os.path.basename(abs_norm)
+        await channel.send(file=discord.File(abs_norm, filename=filename))
+        return f"<<<ATTACH>>>\npath: {abs_norm}\nsize: {size:,} bytes\nfilename: {filename}\nstatus: posted to channel\n<<<END>>>"
+    except Exception as exc:
+        return f"<<<ATTACH_ERROR>>>\npath: {path}\nerror: {type(exc).__name__}: {exc}\n<<<END>>>"
+
+
+def _image_file_to_b64(path):
+    """Read local image file, optionally resize via VISION_MAX_DIM, return base64.
+    Mirrors fetch_attachment()'s resize logic but for filesystem files instead
+    of Discord uploads. Returns (b64_str, error_or_None)."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except Exception as e:
+        return None, f"file read failed: {type(e).__name__}: {e}"
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        from PIL import Image
+        max_dim = int(os.getenv("VISION_MAX_DIM", "1536"))
+        if max_dim > 0:
+            img = Image.open(io.BytesIO(raw))
+            if max(img.size) > max_dim:
+                img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+                buf = io.BytesIO()
+                fmt = "PNG" if ext == ".png" else "JPEG"
+                if fmt == "JPEG" and img.mode != "RGB":
+                    img = img.convert("RGB")
+                img.save(buf, format=fmt, quality=92)
+                raw = buf.getvalue()
+                log.info(f"resized {path} -> max {max_dim}px ({len(raw):,} bytes)")
+    except ImportError:
+        log.warning("PIL not installed — sending raw image (pip install Pillow to enable resize)")
+    except Exception as resize_err:
+        log.warning(f"image resize failed for {path}: {resize_err} — sending raw")
+    return base64.b64encode(raw).decode("ascii"), None
+
+
+async def _comfy_status():
+    """Returns True if ComfyUI's HTTP API responds. Quick 3s timeout."""
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3)) as session:
+            async with session.get(f"{COMFY_HOST}/system_stats") as resp:
+                return resp.status == 200
+    except Exception:
+        return False
+
+
+async def _comfy_stop():
+    """Find process listening on COMFY_HOST's port + kill it. Windows-specific
+    using PowerShell + taskkill. Returns human-readable status string."""
+    port = urlparse(COMFY_HOST).port or 8000
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "powershell", "-NoProfile", "-Command",
+            f"(Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue).OwningProcess",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        pids = []
+        seen = set()
+        for line in stdout.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line.isdigit() and line not in seen:
+                pids.append(line)
+                seen.add(line)
+        if not pids:
+            return f"no process found on port {port}"
+        killed = []
+        for pid in pids:
+            kp = await asyncio.create_subprocess_exec(
+                "taskkill", "/F", "/PID", pid,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(kp.communicate(), timeout=5)
+            if kp.returncode == 0:
+                killed.append(pid)
+        return f"killed PID(s): {', '.join(killed)}" if killed else "found PIDs but taskkill failed"
+    except Exception as exc:
+        return f"stop failed: {type(exc).__name__}: {exc}"
+
+
+async def _comfy_start():
+    """Launch ComfyUI via COMFY_LAUNCH_CMD detached from the bot process.
+    Polls /system_stats for up to 60s waiting for it to become ready."""
+    if await _comfy_status():
+        return "already running"
+    if not os.path.exists(COMFY_LAUNCH_CMD):
+        return f"launcher not found: {COMFY_LAUNCH_CMD} (set COMFY_LAUNCH_CMD env var)"
+    try:
+        # DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP so it survives bot restart
+        creationflags = 0
+        if sys.platform == "win32":
+            creationflags = (
+                subprocess.DETACHED_PROCESS |
+                subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        proc = subprocess.Popen(
+            [COMFY_LAUNCH_CMD],
+            creationflags=creationflags,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except Exception as exc:
+        return f"launch failed: {type(exc).__name__}: {exc}"
+    # Poll for readiness (ComfyUI Desktop takes 10-30s on cold start)
+    for elapsed in range(0, 60):
+        await asyncio.sleep(1)
+        if await _comfy_status():
+            return f"launched (PID {proc.pid}) — ready in {elapsed + 1}s"
+    return f"launched (PID {proc.pid}) but not responding after 60s — check manually"
+
+
+def _ollama_api_base():
+    """Derive the Ollama API base URL from OLLAMA_URL (which points at /api/chat)."""
+    # OLLAMA_URL is e.g. "http://localhost:11434/api/chat" — strip the /api/chat suffix
+    return OLLAMA_URL.replace("/api/chat", "").rstrip("/")
+
+
+def _fmt_bytes(n):
+    """Human-readable bytes (GB / MB)."""
+    if n >= 1024 ** 3:
+        return f"{n / 1024**3:.1f}GB"
+    if n >= 1024 ** 2:
+        return f"{n / 1024**2:.0f}MB"
+    return f"{n}B"
+
+
+async def _ollama_ps():
+    """Get currently RUNNING models via /api/ps. Equivalent of CLI 'ollama ps'."""
+    base = _ollama_api_base()
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with session.get(f"{base}/api/ps") as resp:
+                if resp.status != 200:
+                    return f"⚠️ /api/ps returned HTTP {resp.status}"
+                data = await resp.json()
+        models = data.get("models", []) or []
+        if not models:
+            return "📭 **Ollama:** no models currently loaded (will cold-start on next call)"
+        lines = [f"🧠 **Ollama running ({len(models)} loaded):**"]
+        for m in models:
+            name = m.get("name", "?")
+            size = m.get("size", 0)
+            vram = m.get("size_vram", 0)
+            expires = m.get("expires_at", "")
+            cpu_gpu = "100% CPU" if vram == 0 else f"GPU+CPU ({_fmt_bytes(vram)} VRAM)"
+            until = expires[:19].replace("T", " ") if expires else "forever"
+            lines.append(f"  • `{name}` — {_fmt_bytes(size)} — {cpu_gpu} — until {until}")
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"⚠️ /api/ps failed: {type(exc).__name__}: {exc}"
+
+
+async def _ollama_list():
+    """List all INSTALLED models via /api/tags. Equivalent of CLI 'ollama list'."""
+    base = _ollama_api_base()
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with session.get(f"{base}/api/tags") as resp:
+                if resp.status != 200:
+                    return f"⚠️ /api/tags returned HTTP {resp.status}"
+                data = await resp.json()
+        models = data.get("models", []) or []
+        if not models:
+            return "📭 no models installed"
+        # Sort by size descending — biggest first
+        models.sort(key=lambda m: m.get("size", 0), reverse=True)
+        lines = [f"💾 **Ollama installed ({len(models)} models):**"]
+        for m in models:
+            name = m.get("name", "?")
+            size = m.get("size", 0)
+            lines.append(f"  • `{name}` — {_fmt_bytes(size)}")
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"⚠️ /api/tags failed: {type(exc).__name__}: {exc}"
+
+
+async def _ollama_unload(model_name):
+    """Unload a specific model from RAM via keep_alive: 0.
+    Doesn't restart Ollama itself — just evicts the model. Safe for in-flight chat."""
+    base = _ollama_api_base()
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.post(
+                f"{base}/api/generate",
+                json={"model": model_name, "keep_alive": 0, "prompt": ""},
+            ) as resp:
+                body = await resp.text()
+                if resp.status != 200:
+                    return f"⚠️ unload HTTP {resp.status}: {body[:200]}"
+        return f"♻️ unloaded `{model_name}` (RAM freed; next call will cold-load)"
+    except Exception as exc:
+        return f"⚠️ unload failed: {type(exc).__name__}: {exc}"
+
+
+async def _tool_see_batch(dir_path, prompt, model, channel, label="!see-batch"):
+    """Bulk vision over every image in a directory. Posts a live progress
+    placeholder + final .txt attachment with all descriptions concatenated.
+    Capped at SEE_BATCH_MAX images per run (default 20)."""
+    ok, err = _is_path_allowed(dir_path)
+    if not ok:
+        await channel.send(f"```\n<<<BATCH_ERROR>>>\npath: {dir_path}\nerror: {err}\n<<<END>>>\n```")
+        return
+    abs_norm = _normalize_path(dir_path)
+    if not os.path.exists(abs_norm):
+        await channel.send(f"*[{label} error: directory not found: `{dir_path}`]*")
+        return
+    if not os.path.isdir(abs_norm):
+        await channel.send(f"*[{label} error: not a directory: `{dir_path}`]*")
+        return
+
+    # Collect images (sorted alphabetically for deterministic ordering)
+    images = []
+    for entry in sorted(os.listdir(abs_norm)):
+        full = os.path.join(abs_norm, entry)
+        if os.path.isfile(full) and os.path.splitext(entry)[1].lower() in IMAGE_EXTS:
+            images.append((entry, full))
+    if not images:
+        await channel.send(f"*[{label}: no images found in `{abs_norm}`]*")
+        return
+
+    capped = False
+    if len(images) > SEE_BATCH_MAX:
+        capped = True
+        images = images[:SEE_BATCH_MAX]
+
+    short_model = model.split("/")[-1]
+    short_dir = os.path.basename(abs_norm) or abs_norm
+    cap_note = f" (capped from {SEE_BATCH_MAX}+ — raise SEE_BATCH_MAX to process more)" if capped else ""
+    progress = await channel.send(
+        f"📂 **{label}** — `{short_dir}` — {len(images)} images via `{short_model}`{cap_note}\n"
+        f"*starting batch — est. ~{len(images) * 30}s for light vision, ~{len(images) * 120}s for heavy*"
+    )
+
+    results = []  # (filename, elapsed_seconds, description_or_error)
+    batch_start = time.monotonic()
+    for i, (fname, fpath) in enumerate(images):
+        img_start = time.monotonic()
+        short_fname = fname if len(fname) <= 35 else (fname[:32] + "…")
+        # Pre-streaming state: show what's about to run before first tokens arrive
+        try:
+            elapsed_total = int(time.monotonic() - batch_start)
+            await progress.edit(
+                content=f"📂 **{label}** — `{short_dir}` — {i+1}/{len(images)} ⏳\n"
+                        f"current: `{short_fname}` — total: {elapsed_total}s — *encoding + waking model...*"
+            )
+        except Exception:
+            pass
+
+        # Live-streaming callback — edits placeholder w accumulated description
+        # for the CURRENT image so operator can see tokens flowing in real time.
+        # Throttled inside _tool_vision (1.5s between calls), safe re: Discord rate limit.
+        async def on_token(accumulated, _i=i, _img_start=img_start, _short=short_fname):
+            total_elapsed = int(time.monotonic() - batch_start)
+            img_elapsed = int(time.monotonic() - _img_start)
+            body = accumulated if len(accumulated) <= 1500 else (accumulated[:1500] + "…")
+            try:
+                await progress.edit(
+                    content=f"📂 **{label}** — `{short_dir}` — {_i+1}/{len(images)} ⏳\n"
+                            f"current: `{_short}` — img: {img_elapsed}s — total: {total_elapsed}s ▌\n\n{body}"
+                )
+            except discord.HTTPException:
+                pass  # rate limited or msg gone — skip
+
+        # Run vision on this image with live streaming
+        try:
+            desc = await _tool_vision(fpath, prompt, model=model, on_token=on_token)
+            elapsed = int(time.monotonic() - img_start)
+            results.append((fname, elapsed, desc))
+            log.info(f"[{label}] {i+1}/{len(images)} {fname} done in {elapsed}s")
+        except Exception as exc:
+            log.exception(f"[{label}] failed on {fname}")
+            results.append((fname, 0, f"FAILED: {type(exc).__name__}: {exc}"))
+
+    total = int(time.monotonic() - batch_start)
+    avg = total / max(len(images), 1)
+
+    # Build the consolidated .txt output
+    out_lines = [
+        f"=== BATCH VISION ANALYSIS ===",
+        f"Directory:  {abs_norm}",
+        f"Model:      {model}",
+        f"Prompt:     {prompt}",
+        f"Total:      {len(images)} images, {total}s ({avg:.1f}s avg)",
+        "",
+    ]
+    for fname, elapsed, desc in results:
+        out_lines.append(f"--- {fname} ({elapsed}s) ---")
+        out_lines.append(desc.strip())
+        out_lines.append("")
+    output_text = "\n".join(out_lines)
+
+    # Final progress + attach .txt
+    try:
+        await progress.edit(
+            content=f"📂 **{label}** — `{short_dir}` ✅ done\n"
+                    f"{len(images)} images in {total}s (avg {avg:.1f}s/img) — full output attached"
+        )
+    except Exception:
+        pass
+
+    buf = io.BytesIO(output_text.encode("utf-8"))
+    out_filename = f"batch_{short_dir.replace(' ', '_')}_{int(time.time())}.txt"
+    try:
+        await channel.send(
+            content=f"📄 *{len(images)} descriptions concatenated — {len(output_text):,} chars*",
+            file=discord.File(buf, filename=out_filename),
+        )
+    except Exception as exc:
+        # If file too big, fall back to inline (truncated)
+        log.exception(f"[{label}] attachment failed")
+        await channel.send(f"*[failed to attach output: {exc}]*")
+
+
+async def _tool_vision(path, prompt, model=None, on_token=None):
+    """Vision tool — reads local image, sends to vision model, returns text.
+    If `model` is None, uses default routing (VISION_MODEL_NAME via _select_stream).
+    If `model` is specified, forces stream_ollama with that exact model
+    (used by !vision to invoke VISION_HEAVY_MODEL_NAME). Returns streamed text.
+
+    on_token: optional async callback(accumulated_text) invoked periodically as
+    tokens arrive — used for live-streaming the vision output to a Discord
+    placeholder so the operator can see it generating in real time."""
+    ok, err = _is_path_allowed(path)
+    if not ok:
+        return f"<<<VISION_ERROR>>>\npath: {path}\nerror: {err}\n<<<END>>>"
+    abs_norm = _normalize_path(path)
+    if not os.path.exists(abs_norm):
+        return f"<<<VISION_ERROR>>>\npath: {path}\nerror: does not exist\n<<<END>>>"
+    if os.path.isdir(abs_norm):
+        return f"<<<VISION_ERROR>>>\npath: {path}\nerror: is a directory\n<<<END>>>"
+    ext = os.path.splitext(abs_norm)[1].lower()
+    if ext not in IMAGE_EXTS:
+        return f"<<<VISION_ERROR>>>\npath: {path}\nerror: not a recognized image format ({ext}) — supported: {sorted(IMAGE_EXTS)}\n<<<END>>>"
+
+    b64, b64_err = _image_file_to_b64(abs_norm)
+    if b64_err:
+        return f"<<<VISION_ERROR>>>\npath: {path}\nerror: {b64_err}\n<<<END>>>"
+
+    messages = [{
+        "role": "user",
+        "content": prompt or "describe this image in detail",
+        "images": [b64],
+    }]
+    try:
+        chunks = []
+        last_cb = 0.0
+        stream = (
+            stream_ollama(messages, model_override=model) if model
+            else _select_stream(messages)
+        )
+        async for tok in stream:
+            chunks.append(tok)
+            # Throttled callback (~1 edit per 1.5s — under Discord's 5-per-5s edit cap)
+            if on_token is not None:
+                now = time.monotonic()
+                if now - last_cb >= 1.5:
+                    try:
+                        await on_token("".join(chunks))
+                    except Exception:
+                        pass  # callback failures shouldn't kill the stream
+                    last_cb = now
+        text = "".join(chunks).strip()
+        # Final callback with completed text
+        if on_token is not None:
+            try:
+                await on_token(text)
+            except Exception:
+                pass
+        return text or "[vision model returned empty]"
+    except Exception as exc:
+        return f"<<<VISION_ERROR>>>\npath: {path}\nerror: stream failed: {type(exc).__name__}: {exc}\n<<<END>>>"
+
+
+# =========================================================================
+# (end agentic tool helpers)
+# =========================================================================
 
 
 def _matches(content, phrases):
@@ -391,6 +1003,143 @@ def is_scene_command(content):
         if c == p or c.startswith(p + " ") or c.startswith(p + "\n"):
             return True
     return False
+
+
+def _is_phrase_prefix(content, phrases):
+    """Returns the matched phrase + rest of content, or (None, None)."""
+    c = content.lstrip()
+    cl = c.lower()
+    for p in phrases:
+        if cl == p:
+            return p, ""
+        if cl.startswith(p + " ") or cl.startswith(p + "\n"):
+            return p, c[len(p):].lstrip()
+    return None, None
+
+
+def is_list_command(content):
+    """!list <path> — direct filesystem listing, bypasses LLM entirely."""
+    return _is_phrase_prefix(content, LIST_PHRASES)[0] is not None
+
+
+def is_read_command(content):
+    """!read <path> — direct file read, bypasses LLM entirely."""
+    return _is_phrase_prefix(content, READ_PHRASES)[0] is not None
+
+
+def is_attach_command(content):
+    """!attach <path> — direct file attach, bypasses LLM entirely."""
+    return _is_phrase_prefix(content, ATTACH_PHRASES)[0] is not None
+
+
+def is_see_command(content):
+    """!see [path] [prompt] — light/parallel-safe vision analysis (VISION_MODEL_NAME).
+    Use for fast description + when ComfyUI + text model are also active."""
+    return _is_phrase_prefix(content, SEE_PHRASES)[0] is not None
+
+
+def is_vision_command(content):
+    """!vision [path] [prompt] — heavy abliterated vision (VISION_HEAVY_MODEL_NAME).
+    Max detail + uncensored. Slower, swaps in. Best for NSFW refs + max-quality analysis."""
+    return _is_phrase_prefix(content, VISION_PHRASES)[0] is not None
+
+
+def is_see_batch_command(content):
+    """!see-batch <dir> [prompt] — bulk vision on every image in a directory (light model)."""
+    return _is_phrase_prefix(content, SEE_BATCH_PHRASES)[0] is not None
+
+
+def is_vision_batch_command(content):
+    """!vision-batch <dir> [prompt] — bulk vision (heavy model, slow + RAM-heavy)."""
+    return _is_phrase_prefix(content, VISION_BATCH_PHRASES)[0] is not None
+
+
+def is_comfy_command(content):
+    """!comfy <status|start|stop|restart> — remote-control ComfyUI server."""
+    return _is_phrase_prefix(content, COMFY_PHRASES)[0] is not None
+
+
+def is_ollama_command(content):
+    """!ollama <ps|list|unload> — inspect Ollama state. NO restart (would kill in-flight LLM call)."""
+    return _is_phrase_prefix(content, OLLAMA_PHRASES)[0] is not None
+
+
+def is_sitrep_command(content):
+    """!sitrep — combined ollama ps + comfy status snapshot."""
+    return _is_phrase_prefix(content, SITREP_PHRASES)[0] is not None
+
+
+def is_help_command(content):
+    """!help / !commands / !cheatsheet — dump available commands."""
+    return _is_phrase_prefix(content, HELP_PHRASES)[0] is not None
+
+
+# Authoritative command reference. Used by !help direct command AND injected
+# into LLM context when operator asks free-form help questions.
+COMMAND_REFERENCE = """**SERVITOR Command Reference** (whitelist-gated)
+
+**Image Generation (ComfyUI):**
+`!gen <prompt>`            — SDXL gen using gen_template.json (1024×1024, no LoRA)
+`!gen --seed <N> <prompt>` — same but with fixed seed for reproducible variants
+`!scene <prompt>`          — landscape gen (1216×832, no people in negatives)
+
+**Filesystem Tools (allowlist-gated):**
+`!list <path>` / `!ls`     — directory listing
+`!read <path>` / `!cat`    — read file contents (inline if ≤1.9KB, else as .txt attachment)
+`!attach <path>` / `!send` — post file as Discord attachment
+
+**Vision:**
+`!see <path>` / `!look` / `!describe` / `!check`
+   ↳ light vision (qwen2.5vl:3b ~5-7GB RAM, parallel-safe with ComfyUI)
+`!vision <path>` / `!v`
+   ↳ heavy vision (abliterated 7B, max detail, ~10-12GB RAM — stop ComfyUI first)
+`!see-batch <dir> [prompt]` / `!sb`
+   ↳ bulk light-vision on every image in a directory (capped at SEE_BATCH_MAX=20)
+   ↳ posts a .txt attachment w all descriptions concatenated
+`!vision-batch <dir> [prompt]` / `!vb`
+   ↳ bulk heavy-vision (slow + RAM-heavy — stop ComfyUI first)
+Default path if not specified: `C:/Users/gwu07/Desktop/vision.png`
+
+**Prompt templates that work well for vision batches:**
+```
+respond ONLY with 10-15 comma-separated SDXL prompt tags. no explanation.
+```
+```
+describe in 4 tagged sections: SUBJECT, LIGHTING, COMPOSITION, MOOD
+```
+```
+generate a single-paragraph SDXL prompt under 80 words
+```
+(structured prompts reduce repetition-loop failures on heavy abliterated models)
+
+**ComfyUI Server Control:**
+`!comfy status` / `?`      — is it running?
+`!comfy start` / `on`      — launch ComfyUI Desktop
+`!comfy stop` / `off`      — kill ComfyUI (frees ~5GB RAM)
+`!comfy restart`           — stop + 2s wait + start
+
+**Ollama Inspection (no restart — would kill in-flight LLM):**
+`!ollama ps` / `status`    — what's loaded in RAM right now
+`!ollama list` / `ls`      — all installed models on disk
+`!ollama unload <model>`   — evict a model from RAM (safe, no daemon restart)
+
+**System Snapshot:**
+`!sitrep` / `!status` / `!sit` — combined Ollama state + ComfyUI status in one msg
+
+**Other:**
+`!help` / `!commands`      — this reference
+`stfu` / `skip`            — cancel bot's in-flight reply
+`clear`                    — wipe channel memory
+`!auth` / `!whitelist`     — show whitelisted operators
+
+**LLM-Emitted Sentinels (used by bot in natural-language chat):**
+`[GENERATE]: <prompt>`     — auto-trigger SDXL gen when bot decides image helps
+`[VISION]: <path> <prompt>` — auto-trigger vision analysis on a file path
+`[LIST]: <path>`           — auto-list a directory
+`[READ]: <path>`           — auto-read a file
+`[ATTACH]: <path>`         — auto-post a file
+`[WEBSEARCH]: <query>`     — web search (if SEARCH_ENABLED in .env)
+"""
 
 
 def _make_progress_callback(placeholder, prefix, throttle_sec=2.0, bar_width=20):
@@ -575,10 +1324,10 @@ def _pick_model(messages):
 
 
 def _pick_system_prompt(messages):
-    """Minimal vision-side prompt when images are present, otherwise full persona.
-    Small vision models (moondream:1.8b, llava-phi3) choke on persona-heavy
-    prompts and return garbage. Persona stays for all text chat."""
-    return VISION_SYSTEM_PROMPT if _has_images(messages) else SYSTEM_PROMPT
+    """Minimal vision-side prompt when images are present, otherwise full persona
+    (hot-reloaded from disk on file change). Small vision models choke on
+    persona-heavy prompts so vision keeps its own static minimal prompt."""
+    return VISION_SYSTEM_PROMPT if _has_images(messages) else _get_live_system_prompt()
 
 
 async def query_ollama(messages):
@@ -604,21 +1353,31 @@ async def query_ollama(messages):
             return data.get("message", {}).get("content", "").strip()
 
 
-async def stream_ollama(messages):
+async def stream_ollama(messages, model_override=None):
     """Async generator yielding token chunks from Ollama's streaming API.
-       Auto-switches to VISION_MODEL_NAME when any message carries images."""
-    model = _pick_model(messages)
-    log.info(f"Ollama model -> {model} (vision={_has_images(messages)})")
+       Auto-switches to VISION_MODEL_NAME when any message carries images.
+       Pass model_override to force a specific model regardless of routing
+       (used by !vision command to force the heavy abliterated 7B model).
+
+       Vision calls get a num_predict cap (default 800 tokens) to prevent the
+       abliterated models' known repetition-loop failure mode that wasted
+       14 minutes generating "stylish living room" over and over."""
+    model = model_override or _pick_model(messages)
+    has_images = _has_images(messages)
+    log.info(f"Ollama model -> {model} (vision={has_images}, override={model_override is not None})")
+    options = {
+        "temperature": 0.8,
+        "top_p": 0.9,
+        "num_ctx": 4096,
+    }
+    if has_images:
+        options["num_predict"] = int(os.getenv("VISION_MAX_TOKENS", "800"))
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": _pick_system_prompt(messages)}] + messages,
         "stream": True,
         "keep_alive": -1,
-        "options": {
-            "temperature": 0.8,
-            "top_p": 0.9,
-            "num_ctx": 4096,
-        },
+        "options": options,
     }
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -972,6 +1731,273 @@ async def on_message(message):
             log.exception("[SCENE] unexpected failure")
         return
 
+    # =========================================================================
+    # Direct filesystem commands: !list / !read / !attach
+    # Bypasses the LLM entirely — runs the same _tool_* handlers as the
+    # [LIST]/[READ]/[ATTACH] sentinel path. Use these when u want guaranteed
+    # tool execution + raw output, without depending on the model's instruction-
+    # following. Allowlist + blocklist still apply.
+    # =========================================================================
+
+    if is_whitelisted(message.author) and is_list_command(message.content):
+        _, path = _is_phrase_prefix(message.content, LIST_PHRASES)
+        if not path:
+            await message.channel.send(
+                "*[usage: `!list <path>`  •  `!ls <path>`  •  `/list <path>`]*"
+            )
+            return
+        log.info(f"[!LIST] {message.author.name} -> {path!r}")
+        result = _tool_list(path)
+        # Stuff result into a fenced block. Soft-truncate at 1900 chars (Discord cap 2000).
+        body = result if len(result) <= 1900 else (result[:1900] + "\n…[truncated]")
+        await message.channel.send(f"```\n{body}\n```")
+        return
+
+    if is_whitelisted(message.author) and is_read_command(message.content):
+        _, path = _is_phrase_prefix(message.content, READ_PHRASES)
+        if not path:
+            await message.channel.send(
+                "*[usage: `!read <path>`  •  `!cat <path>`  •  `/read <path>`]*"
+            )
+            return
+        log.info(f"[!READ] {message.author.name} -> {path!r}")
+        result = _tool_read(path)
+        # If result fits in one Discord message (with fence overhead), inline it.
+        # Otherwise post as a .txt attachment so nothing gets truncated.
+        if len(result) <= 1900:
+            await message.channel.send(f"```\n{result}\n```")
+        else:
+            # Convert to a tempfile-style attachment via discord.File from BytesIO
+            buf = io.BytesIO(result.encode("utf-8"))
+            fname = (path.split("/")[-1] or "file") + ".read.txt"
+            await message.channel.send(
+                content=f"*[!read result — {len(result):,} bytes — attached as file]*",
+                file=discord.File(buf, filename=fname),
+            )
+        return
+
+    if is_whitelisted(message.author) and is_attach_command(message.content):
+        _, path = _is_phrase_prefix(message.content, ATTACH_PHRASES)
+        if not path:
+            await message.channel.send(
+                "*[usage: `!attach <path>`  •  `!send <path>`  •  `/attach <path>`]*"
+            )
+            return
+        log.info(f"[!ATTACH] {message.author.name} -> {path!r}")
+        result = await _tool_attach(path, message.channel)
+        # _tool_attach already posted the file (if successful) — confirm via short msg
+        # If the result starts with <<<ATTACH>>>, the file was sent. Otherwise show error.
+        if result.startswith("<<<ATTACH>>>"):
+            try:
+                await message.add_reaction("✅")
+            except Exception:
+                pass
+        else:
+            await message.channel.send(f"```\n{result}\n```")
+        return
+
+    # Shared helper for both !see (light) and !vision (heavy) handlers
+    async def _run_vision_command(phrases, model, icon_label):
+        _, args = _is_phrase_prefix(message.content, phrases)
+        # Parse path + prompt (path defaults to DEFAULT_VISION_PATH if not pathy)
+        path = DEFAULT_VISION_PATH
+        prompt = "describe this image in detail"
+        if args:
+            parts = args.split(None, 1)
+            first = parts[0]
+            looks_like_path = ("/" in first or "\\" in first or
+                               (len(first) >= 2 and first[1] == ":"))
+            if looks_like_path:
+                path = first
+                if len(parts) > 1:
+                    prompt = parts[1]
+            else:
+                prompt = args
+        log.info(f"[{icon_label}] {message.author.name} -> path={path!r} model={model!r} prompt={prompt[:60]!r}")
+        short_model = model.split("/")[-1]
+        short_path = os.path.basename(path)
+        header = f"👁️ `{short_path}` — `{short_model}` — prompt: `{prompt[:60]}`"
+
+        placeholder = await message.channel.send(
+            f"{header}\n*encoding image + waking model...*"
+        )
+        # Live streaming: edit placeholder w accumulated tokens as they arrive
+        start_time = time.monotonic()
+        async def on_token(accumulated):
+            elapsed = int(time.monotonic() - start_time)
+            body = accumulated if len(accumulated) <= 1700 else (accumulated[:1700] + "…")
+            try:
+                await placeholder.edit(
+                    content=f"{header} — *streaming {elapsed}s* ▌\n\n{body}"
+                )
+            except discord.HTTPException:
+                pass  # rate-limited or msg gone — skip silently
+
+        try:
+            result = await _tool_vision(path, prompt, model=model, on_token=on_token)
+            elapsed = int(time.monotonic() - start_time)
+            if result.startswith("<<<VISION_ERROR>>>"):
+                await placeholder.edit(content=f"```\n{result}\n```")
+            else:
+                body = result if len(result) <= 1700 else (result[:1700] + "…[truncated]")
+                await placeholder.edit(
+                    content=f"{header} — *done in {elapsed}s* ✅\n\n{body}"
+                )
+        except Exception as exc:
+            await placeholder.edit(content=f"*[{icon_label} failed: {type(exc).__name__}: {str(exc)[:200]}]*")
+            log.exception(f"[{icon_label}] unexpected failure")
+
+    if is_whitelisted(message.author) and is_see_command(message.content):
+        # Light vision — VISION_MODEL_NAME (default qwen2.5vl:3b ~5-7GB)
+        await _run_vision_command(SEE_PHRASES, VISION_MODEL_NAME, "!SEE")
+        return
+
+    if is_whitelisted(message.author) and is_vision_command(message.content):
+        # Heavy vision — VISION_HEAVY_MODEL_NAME (abliterated 7B ~10-12GB, max detail)
+        await _run_vision_command(VISION_PHRASES, VISION_HEAVY_MODEL_NAME, "!VISION")
+        return
+
+    if is_whitelisted(message.author) and is_see_batch_command(message.content):
+        _, args = _is_phrase_prefix(message.content, SEE_BATCH_PHRASES)
+        if not args:
+            await message.channel.send(
+                "*[usage: `!see-batch <directory> [prompt]` — bulk-describe every image in a dir via light vision]*"
+            )
+            return
+        parts = args.split(None, 1)
+        dir_path = parts[0]
+        prompt = parts[1] if len(parts) > 1 else "describe this image in detail"
+        log.info(f"[!SEE-BATCH] {message.author.name} -> dir={dir_path!r} prompt={prompt[:60]!r}")
+        await _tool_see_batch(dir_path, prompt, VISION_MODEL_NAME, message.channel, label="!see-batch")
+        return
+
+    if is_whitelisted(message.author) and is_vision_batch_command(message.content):
+        _, args = _is_phrase_prefix(message.content, VISION_BATCH_PHRASES)
+        if not args:
+            await message.channel.send(
+                "*[usage: `!vision-batch <directory> [prompt]` — bulk-describe via HEAVY abliterated 7B. slow + RAM-heavy — stop ComfyUI first]*"
+            )
+            return
+        parts = args.split(None, 1)
+        dir_path = parts[0]
+        prompt = parts[1] if len(parts) > 1 else "describe this image in detail"
+        log.info(f"[!VISION-BATCH] {message.author.name} -> dir={dir_path!r} prompt={prompt[:60]!r}")
+        await _tool_see_batch(dir_path, prompt, VISION_HEAVY_MODEL_NAME, message.channel, label="!vision-batch")
+        return
+
+    if is_whitelisted(message.author) and is_comfy_command(message.content):
+        _, args = _is_phrase_prefix(message.content, COMFY_PHRASES)
+        sub = (args or "status").strip().lower().split(None, 1)[0] if (args or "status").strip() else "status"
+        log.info(f"[!COMFY] {message.author.name} -> {sub!r}")
+        if sub in ("status", "stat", "ping", "?"):
+            running = await _comfy_status()
+            icon = "✅" if running else "❌"
+            state = "running" if running else "stopped"
+            await message.channel.send(f"🎨 ComfyUI: {icon} {state}  (port {urlparse(COMFY_HOST).port or 8000})")
+        elif sub in ("stop", "off", "kill", "down"):
+            placeholder = await message.channel.send("⏳ stopping ComfyUI...")
+            result = await _comfy_stop()
+            await placeholder.edit(content=f"⏹ ComfyUI stop: `{result}`")
+        elif sub in ("start", "on", "launch", "boot", "up"):
+            placeholder = await message.channel.send("⏳ launching ComfyUI (cold start can take 10-30s)...")
+            result = await _comfy_start()
+            ok = "ready in" in result or "already running" in result
+            icon = "▶" if ok else "⚠️"
+            await placeholder.edit(content=f"{icon} ComfyUI start: `{result}`")
+        elif sub in ("restart", "reboot", "cycle"):
+            placeholder = await message.channel.send("⏳ restarting ComfyUI (stop → wait 2s → start)...")
+            stop_result = await _comfy_stop()
+            await asyncio.sleep(2)
+            start_result = await _comfy_start()
+            ok = "ready in" in start_result or "already running" in start_result
+            icon = "🔄" if ok else "⚠️"
+            await placeholder.edit(
+                content=f"{icon} ComfyUI restart:\n• stop: `{stop_result}`\n• start: `{start_result}`"
+            )
+        else:
+            await message.channel.send(
+                "*[usage: `!comfy status` / `!comfy start` / `!comfy stop` / `!comfy restart`]*"
+            )
+        return
+
+    if is_whitelisted(message.author) and is_ollama_command(message.content):
+        _, args = _is_phrase_prefix(message.content, OLLAMA_PHRASES)
+        parts = (args or "ps").strip().split(None, 1)
+        sub = parts[0].lower() if parts else "ps"
+        sub_arg = parts[1].strip() if len(parts) > 1 else ""
+        log.info(f"[!OLLAMA] {message.author.name} -> {sub!r} arg={sub_arg!r}")
+        if sub in ("ps", "status", "running", "loaded", "?", ""):
+            result = await _ollama_ps()
+            await message.channel.send(result[:1990])
+        elif sub in ("list", "ls", "tags", "installed", "all"):
+            result = await _ollama_list()
+            # If long, split across messages
+            if len(result) <= 1990:
+                await message.channel.send(result)
+            else:
+                # Split on bullet boundaries
+                lines = result.split("\n")
+                buf = ""
+                for line in lines:
+                    if len(buf) + len(line) + 1 > 1900:
+                        await message.channel.send(buf)
+                        buf = line
+                    else:
+                        buf = buf + "\n" + line if buf else line
+                if buf:
+                    await message.channel.send(buf)
+        elif sub in ("unload", "evict", "kill", "off"):
+            if not sub_arg:
+                await message.channel.send(
+                    "*[usage: `!ollama unload <model_name>` — see `!ollama ps` for loaded names]*"
+                )
+                return
+            placeholder = await message.channel.send(f"⏳ unloading `{sub_arg}`...")
+            result = await _ollama_unload(sub_arg)
+            await placeholder.edit(content=result)
+        else:
+            await message.channel.send(
+                "*[usage: `!ollama ps` (loaded) / `!ollama list` (installed) / `!ollama unload <model>` — NO restart for safety]*"
+            )
+        return
+
+    if is_whitelisted(message.author) and is_sitrep_command(message.content):
+        log.info(f"[!SITREP] {message.author.name}")
+        # Run both probes concurrently to minimize latency
+        ollama_task = asyncio.create_task(_ollama_ps())
+        comfy_task = asyncio.create_task(_comfy_status())
+        ollama_info = await ollama_task
+        comfy_running = await comfy_task
+        comfy_icon = "✅" if comfy_running else "❌"
+        comfy_state = "running" if comfy_running else "stopped"
+        port = urlparse(COMFY_HOST).port or 8000
+        # Build combined sitrep
+        report = (
+            f"🛰 **SITREP**\n"
+            f"\n"
+            f"{ollama_info}\n"
+            f"\n"
+            f"🎨 **ComfyUI:** {comfy_icon} {comfy_state} *(port {port})*"
+        )
+        await message.channel.send(report[:1990])
+        return
+
+    if is_whitelisted(message.author) and is_help_command(message.content):
+        log.info(f"[!HELP] {message.author.name}")
+        # Discord 2000-char limit — split COMMAND_REFERENCE if needed
+        ref = COMMAND_REFERENCE
+        if len(ref) <= 1990:
+            await message.channel.send(ref)
+        else:
+            # Split on a section divider (double newline) closest to midpoint
+            mid = len(ref) // 2
+            split_at = ref.rfind("\n\n", 0, mid + 500)
+            if split_at < 100:
+                split_at = mid
+            await message.channel.send(ref[:split_at])
+            await message.channel.send(ref[split_at:].lstrip())
+        return
+
     # AUTH handler: list whitelisted operators (whitelist-only, no LLM)
     if is_whitelisted(message.author) and _matches(message.content, AUTH_PHRASES):
         log.info(f"AUTH query by {message.author.name}")
@@ -1096,6 +2122,7 @@ async def on_message(message):
         timed_out_or_failed = False
         search_loops = 0       # WEBSEARCH sentinel intercepts so far
         generate_loops = 0     # GENERATE sentinel intercepts so far
+        tool_loops = 0         # [LIST]/[READ]/[ATTACH] tool calls so far
 
         try:
             # Outer loop: each iteration = one ollama call. Sentinel hits trigger
@@ -1109,6 +2136,7 @@ async def on_message(message):
                 sentinel_query = None      # WEBSEARCH
                 generate_prompt = None     # GENERATE
                 generate_seed = None       # optional pinned seed (GENERATE-SEED form)
+                tool_call = None           # (tool_name, arg) when [LIST]/[READ]/[ATTACH] detected
 
                 async for tok in _select_stream(history):
                     full_reply += tok
@@ -1133,6 +2161,17 @@ async def on_message(message):
                             generate_seed = int(g.group(1)) if g.group(1) else None
                             generate_prompt = g.group(2).strip()
                             break  # exit token loop, handle sentinel below
+
+                    # Tool sentinels — [LIST]/[READ]/[ATTACH]. Read-only filesystem tools.
+                    # Allowlist-gated. Same break-and-handle pattern as WEBSEARCH/GENERATE.
+                    if TOOL_ENABLED and tool_loops < TOOL_MAX_LOOPS:
+                        for _tname, (_tmid_re, _) in TOOL_PATTERNS.items():
+                            _tm = _tmid_re.search(full_reply)
+                            if _tm:
+                                tool_call = (_tname, _tm.group(1).strip())
+                                break
+                        if tool_call:
+                            break  # exit token loop, handle below
 
                     # SOFT_LIMIT split (split long replies across multiple Discord msgs)
                     if len(current_chunk) >= SOFT_LIMIT:
@@ -1177,6 +2216,14 @@ async def on_message(message):
                     if g_naked:
                         generate_seed = int(g_naked.group(1)) if g_naked.group(1) else None
                         generate_prompt = g_naked.group(2).strip()
+
+                # Same naked-fallback for tool sentinels
+                if tool_call is None and TOOL_ENABLED and tool_loops < TOOL_MAX_LOOPS:
+                    for _tname, (_, _tnaked_re) in TOOL_PATTERNS.items():
+                        _tm = _tnaked_re.search(full_reply.rstrip())
+                        if _tm:
+                            tool_call = (_tname, _tm.group(1).strip())
+                            break
 
                 if sentinel_query:
                     # WEBSEARCH path: announce, run search, re-prompt
@@ -1275,12 +2322,77 @@ async def on_message(message):
                     sent_msg = await message.channel.send("⌛ *thinking…*")
                     continue
 
+                if tool_call:
+                    # TOOL path: announce, run tool, append result, re-prompt
+                    tool_loops += 1
+                    tool_name, tool_arg = tool_call
+                    log.info(f"[TOOL] {tool_name}({tool_arg!r}) — loop {tool_loops}/{TOOL_MAX_LOOPS}")
+                    try:
+                        await sent_msg.delete()
+                    except Exception:
+                        pass
+                    # User-visible announce so operator can see what the LLM did
+                    icon_map = {"LIST": "📂", "READ": "📄", "ATTACH": "📎", "VISION": "👁️"}
+                    icon = icon_map.get(tool_name, "🔧")
+                    arg_display = tool_arg if len(tool_arg) <= 200 else (tool_arg[:200] + "…")
+                    try:
+                        await message.channel.send(f"{icon} `{tool_name}`: `{arg_display}`")
+                    except Exception:
+                        pass
+                    # Dispatch — each handler returns a string suitable for system-message history
+                    try:
+                        if tool_name == "LIST":
+                            result_text = _tool_list(tool_arg)
+                        elif tool_name == "READ":
+                            result_text = _tool_read(tool_arg)
+                        elif tool_name == "ATTACH":
+                            result_text = await _tool_attach(tool_arg, message.channel)
+                        elif tool_name == "VISION":
+                            # Parse "<path> [prompt]" — first pathy-token is path,
+                            # remainder is the optional prompt. Default path if none.
+                            v_args = tool_arg.strip()
+                            v_parts = v_args.split(None, 1) if v_args else []
+                            if v_parts and ("/" in v_parts[0] or "\\" in v_parts[0]
+                                            or (len(v_parts[0]) >= 2 and v_parts[0][1] == ":")):
+                                v_path = v_parts[0]
+                                v_prompt = v_parts[1] if len(v_parts) > 1 else "describe this image in detail"
+                            elif v_args:
+                                # No path detected — entire arg is prompt, use default path
+                                v_path = DEFAULT_VISION_PATH
+                                v_prompt = v_args
+                            else:
+                                v_path = DEFAULT_VISION_PATH
+                                v_prompt = "describe this image in detail"
+                            description = await _tool_vision(v_path, v_prompt)
+                            if description.startswith("<<<VISION_ERROR>>>"):
+                                result_text = description
+                            else:
+                                result_text = (
+                                    f"<<<VISION>>>\npath: {v_path}\nprompt: {v_prompt}\n"
+                                    f"---\n{description}\n<<<END>>>"
+                                )
+                        else:
+                            result_text = f"<<<TOOL_ERROR>>>\nunknown tool: {tool_name}\n<<<END>>>"
+                    except Exception as exc:
+                        log.exception(f"[TOOL] {tool_name} dispatch failed")
+                        result_text = f"<<<TOOL_ERROR>>>\ntool: {tool_name}\nerror: {type(exc).__name__}: {str(exc)[:200]}\n<<<END>>>"
+                    # Append assistant's emission + tool result to history, re-prompt
+                    history.append({"role": "assistant", "content": full_reply})
+                    history.append({"role": "system", "content": result_text})
+                    log.info(f"[TOOL] {tool_name} result ({len(result_text)} chars): {result_text[:200]}...")
+                    sent_msg = await message.channel.send("⌛ *thinking…*")
+                    continue
+
                 # === normal completion (no sentinel this iteration) ===
                 if current_chunk.strip():
                     await sent_msg.edit(content=current_chunk)
                 else:
                     await sent_msg.edit(content="*[machine-spirit returned nothing]*")
-                log.info(f"Ollama streamed ({len(full_reply)} chars, searches={search_loops})")
+                log.info(f"Ollama streamed ({len(full_reply)} chars, searches={search_loops}, tools={tool_loops})")
+                # Diagnostic: log first 300 chars of reply so we can see if the
+                # model is emitting tool sentinels but mis-formatted (regex miss),
+                # or just refusing/chitchatting (model issue).
+                log.info(f"[REPLY-PREVIEW] {full_reply[:300]!r}")
                 break
 
         except asyncio.CancelledError:
@@ -1324,6 +2436,14 @@ async def on_message(message):
         await task
     except asyncio.CancelledError:
         pass
+    except discord.Forbidden as e:
+        # 403 Missing Permissions — bot lacks Send Messages in this channel.
+        # Log quietly, don't crash on_message. Common in read-only/restricted
+        # channels where the bot is a member but can't reply.
+        log.warning(f"403 (missing perms) in chan={getattr(message.channel,'name','?')!r} "
+                    f"— stream task aborted: {e}")
+    except Exception:
+        log.exception(f"Unhandled exception in stream task for chan={chan_id}")
     finally:
         if active_streams.get(chan_id) is task:
             active_streams.pop(chan_id, None)
