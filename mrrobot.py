@@ -901,6 +901,43 @@ async def _ollama_unload(model_name):
         return f"⚠️ unload failed: {type(exc).__name__}: {exc}"
 
 
+async def _ollama_purge_all():
+    """Unload ALL currently-loaded models from Ollama. Use when low on RAM
+    and need to make room for a bigger model. Daemon stays alive — only
+    evicts model weights from memory."""
+    base = _ollama_api_base()
+    try:
+        # First get the list of loaded models
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with session.get(f"{base}/api/ps") as resp:
+                if resp.status != 200:
+                    return f"⚠️ /api/ps returned HTTP {resp.status} — can't list models to purge"
+                data = await resp.json()
+        models = data.get("models", []) or []
+        if not models:
+            return "📭 nothing loaded — already empty"
+
+        results = []
+        total_freed_gb = 0.0
+        for m in models:
+            name = m.get("name", "?")
+            size = m.get("size", 0)
+            size_gb = size / (1024 ** 3)
+            unload_msg = await _ollama_unload(name)
+            if "♻️" in unload_msg:
+                results.append(f"`{name}` ({size_gb:.1f}GB)")
+                total_freed_gb += size_gb
+            else:
+                results.append(f"`{name}` ⚠️ failed")
+        return (
+            f"♻️ **Purged {len(results)} model(s) from Ollama RAM:**\n"
+            + "\n".join(f"  • {r}" for r in results)
+            + f"\n\n**Freed: ~{total_freed_gb:.1f}GB** — next call will cold-load whatever's needed."
+        )
+    except Exception as exc:
+        return f"⚠️ purge failed: {type(exc).__name__}: {exc}"
+
+
 async def _generate_persona_text(brief, builder_model, on_token=None):
     """Ask the LLM (abliterated by default) to compose a system-prompt persona text
     matching the operator's brief. Returns the cleaned-up text ready to bake.
@@ -1369,7 +1406,8 @@ generate a single-paragraph SDXL prompt under 80 words
 **Ollama Inspection (no restart — would kill in-flight LLM):**
 `!ollama ps` / `status`    — what's loaded in RAM right now
 `!ollama list` / `ls`      — all installed models on disk
-`!ollama unload <model>`   — evict a model from RAM (safe, no daemon restart)
+`!ollama unload <model>`   — evict ONE model from RAM
+`!ollama purge` / `clear`  — evict ALL loaded models (max RAM free, when u need to load big stuff)
 
 **System Snapshot:**
 `!sitrep` / `!status` / `!sit`      — one-shot combined Ollama + ComfyUI snapshot
@@ -2245,9 +2283,14 @@ async def on_message(message):
             placeholder = await message.channel.send(f"⏳ unloading `{sub_arg}`...")
             result = await _ollama_unload(sub_arg)
             await placeholder.edit(content=result)
+        elif sub in ("purge", "purge-all", "evict-all", "clear", "free", "reset"):
+            placeholder = await message.channel.send("⏳ purging ALL loaded models from Ollama RAM...")
+            result = await _ollama_purge_all()
+            await placeholder.edit(content=result[:1990])
         else:
             await message.channel.send(
-                "*[usage: `!ollama ps` (loaded) / `!ollama list` (installed) / `!ollama unload <model>` — NO restart for safety]*"
+                "*[usage: `!ollama ps` (loaded) / `!ollama list` (installed) / "
+                "`!ollama unload <model>` (one) / `!ollama purge` (all) — NO restart for safety]*"
             )
         return
 
