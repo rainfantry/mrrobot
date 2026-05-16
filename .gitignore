@@ -43,6 +43,12 @@ batch_*.txt
 # Generated Modelfiles from !freeze command (contain personal system prompt)
 Modelfile.*
 
+# ComfyUI workflow files — per-bot config (Verena bot uses LoRA + portrait;
+# generic agent uses no-LoRA + square). Tracked .example versions are the
+# defaults; copy to .json on first clone + customize per bot.
+gen_template.json
+scene_template.json
+
 # Runtime logs
 bot.log
 bot.stdout.log

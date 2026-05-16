@@ -25,6 +25,20 @@ if not exist "%~dp0system_prompt.txt" (
     .\venv\Scripts\python.exe mrrobot.py --dump-baseline
 )
 
+REM ---- BOOTSTRAP: ensure ComfyUI workflow JSONs exist (per-bot — gitignored) ----
+if not exist "%~dp0gen_template.json" (
+    if exist "%~dp0gen_template.json.example" (
+        echo [BOOTSTRAP] gen_template.json missing - copying from .example
+        copy /Y "%~dp0gen_template.json.example" "%~dp0gen_template.json" >NUL
+    )
+)
+if not exist "%~dp0scene_template.json" (
+    if exist "%~dp0scene_template.json.example" (
+        echo [BOOTSTRAP] scene_template.json missing - copying from .example
+        copy /Y "%~dp0scene_template.json.example" "%~dp0scene_template.json" >NUL
+    )
+)
+
 REM ---- PRE-FLIGHT: PROMPT REVIEW MENU ----
 :prompt_menu
 echo.
