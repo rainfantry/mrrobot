@@ -10,6 +10,109 @@ read this once front to back. then keep it next to the rig as a reference card. 
 
 ---
 
+## setup from zero (first-time install — skip if already running)
+
+if u dont have python, ollama, a venv, a discord bot, or any of this yet — start here. ~20-30 min from clean machine to bot online.
+
+### prerequisites
+
+- windows 10/11 (linux/mac mostly works too — scripts are bash-compatible, just adapt paths)
+- ~30 gb free disk (ollama models + comfyui + python)
+- gpu is optional but heavily recommended. nvidia preferred. 8gb+ vram lets u run 7b models smoothly. cpu-only works but slow (1-5 tok/s)
+- internet for the one-time downloads
+
+### 1. install python 3.12
+
+newer pythons (3.13/3.14) break some ml deps. stick with 3.12.
+
+1. download installer from https://python.org/downloads
+2. tick **"add python to PATH"** during install
+3. verify in powershell: `py -3.12 --version` → should print `Python 3.12.x`
+
+### 2. install ollama
+
+1. download from https://ollama.com/download
+2. install (windows installer is one-click)
+3. ollama auto-starts as a tray app. leave it running.
+4. verify: `ollama --version` → should print version
+
+### 3. pull the models
+
+in powershell (each is a few gb, takes 1-10 min depending on bandwidth):
+
+```
+ollama pull huihui_ai/qwen2.5-coder-abliterate:7b
+ollama pull huihui_ai/qwen2.5-vl-abliterated:3b
+```
+
+these are the defaults referenced in `.env.example`. coder = text chat. vl = vision for image attachments. other models are optional — see §2 (the council) for what each does.
+
+### 4. register ur discord bot
+
+1. go to https://discord.com/developers/applications
+2. **New Application** → name it (e.g. SERVITOR)
+3. **Bot** tab → **Reset Token** → COPY THE TOKEN (shown once, save it now)
+4. **Privileged Gateway Intents** → enable **Message Content Intent** (required, otherwise i cant read messages)
+5. **OAuth2** → **URL Generator**:
+   - scopes: `bot` + `applications.commands`
+   - bot permissions: `Send Messages`, `Read Message History`, `Attach Files`, `Add Reactions`, `Embed Links`
+6. copy the generated url → paste in browser → invite the bot to ur discord server
+
+### 5. clone + bootstrap
+
+```
+git clone https://github.com/rainfantry/mrrobot.git
+cd mrrobot
+py -3.12 -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+(on linux/mac: `source venv/bin/activate` instead of the .bat path)
+
+### 6. configure .env
+
+```
+copy .env.example .env
+notepad .env
+```
+
+minimum fields to set:
+- `DISCORD_BOT_TOKEN=` — paste the token from step 4
+- `WHITELIST_USERS=` — ur discord username in lowercase, e.g. `WHITELIST_USERS=jewge`
+- everything else has sensible defaults
+
+save + close notepad.
+
+### 7. (optional) install comfyui for `!gen` image generation
+
+skip this section if u dont need image gen. text chat works without comfyui.
+
+1. download comfyui desktop from https://www.comfy.org/download
+2. install, run it once, let it download sdxl base + xformers (~10gb)
+3. by default comfyui listens on `localhost:8188` — matches `COMFY_HOST` default in `.env`. if comfyui binds a different port, update `COMFY_HOST` in `.env` accordingly.
+4. download a base SDXL checkpoint to comfyui's `models/checkpoints/`. recommended: `RealVisXL_V5.0` or `Juggernaut-XL_v9` from huggingface.
+
+#### 7.1 train a custom LoRA (optional, for character-specific gen)
+
+if u want SERVITOR to gen images of a specific person/character, train a LoRA via the companion repo:
+
+→ https://github.com/rainfantry/sdxl-lora-kit
+
+bare-pod runpod bootstrap script in there pulls everything (kohya, sdxl base, ur dataset from gdrive), trains a LoRA in ~50 min on a 3090 (~$0.25 on runpod community cloud). drop the resulting `.safetensors` into ur local comfyui's `models/loras/` folder + reference it from `gen_template.json`.
+
+### 8. launch
+
+double-click `start_servitor.bat`. it bootstraps `system_prompt.txt` + template jsons, waits for ollama, preloads models, then launches me in a separate cmd window. look for:
+
+```
+[INFO] SERVITOR online as SERVITOR#NNNN
+```
+
+go to ur discord server → type `servitor hello` in any channel where i can read. if i answer, ur done.
+
+---
+
 ## 0. quick start (the absolute minimum)
 
 ```

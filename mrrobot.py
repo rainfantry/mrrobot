@@ -23,6 +23,8 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from claude_relay import setup_claude_relay
+
 try:
     import pdfplumber
 except ImportError:
@@ -52,10 +54,28 @@ except ImportError:
 
 try:
     from comfyui_bridge import generate_image as comfy_generate
-    from comfyui_bridge import COMFY_SCENE_TEMPLATE_PATH
+    from comfyui_bridge import COMFY_SCENE_TEMPLATE_PATH, COMFY_NGEN_TEMPLATE_PATH, COMFY_GEN1_TEMPLATE_PATH, COMFY_V_TEMPLATE_PATH, COMFY_C_TEMPLATE_PATH, COMFY_DEGEN_TEMPLATE_PATH
 except ImportError:
     comfy_generate = None
+
+# Lyric workshop pipeline — [LYRIC]: sentinel handler.
+# Parses cadence-transfer requests, runs sub-LLM with the engine spec, validates
+# via CMU dict / pronouncing lib, logs every attempt to library/iteration_log.md.
+# See lyric_engine.py + cadence_validator.py + lyric_library.py for the stack.
+try:
+    from lyric_engine import handle_lyric_sentinel, format_reinjection as lyric_format_reinjection
+    from lyric_engine import LYRIC_RE, LYRIC_NAKED_RE
+except ImportError:
+    handle_lyric_sentinel = None
+    lyric_format_reinjection = None
+    LYRIC_RE = None
+    LYRIC_NAKED_RE = None
     COMFY_SCENE_TEMPLATE_PATH = None
+    COMFY_NGEN_TEMPLATE_PATH = None
+    COMFY_GEN1_TEMPLATE_PATH = None
+    COMFY_V_TEMPLATE_PATH = None
+    COMFY_C_TEMPLATE_PATH = None
+    COMFY_DEGEN_TEMPLATE_PATH = None
 
 load_dotenv(override=True)  # .env wins over pre-existing shell env vars
 
@@ -157,6 +177,16 @@ GENERATE_ENABLED   = os.getenv("GENERATE_ENABLED", "true").lower() in ("true", "
 #   "0"  -> hard disable (any positive emission rejected)
 _gml_raw = os.getenv("GENERATE_MAX_LOOPS", "2").lower().strip()
 GENERATE_MAX_LOOPS = None if _gml_raw in ("-1", "none", "unlimited", "infinite") else int(_gml_raw)
+
+# === [LYRIC]: sentinel — cadence-transfer lyric workshop ===
+# Block-shaped sentinel: payload spans multiple lines (TOPIC / DEPTH / REFERENCE
+# verse). Routes to lyric_engine.handle_lyric_sentinel(), which makes a sub-LLM
+# call with the cadence-engine system prompt, validates the candidate verse via
+# cadence_validator (CMU/pronouncing), logs to library/iteration_log.md, and
+# returns a re-injection block with either the verified verse or best-effort
+# candidates + validation report.
+LYRIC_ENABLED    = os.getenv("LYRIC_ENABLED", "true").lower() in ("true", "1", "yes", "on")
+LYRIC_MAX_LOOPS  = int(os.getenv("LYRIC_MAX_LOOPS", "2"))   # per user turn
 
 # === Agentic tools — [LIST] / [READ] / [ATTACH] sentinels (read-only Level 1) ===
 # Bot LLM can emit these to inspect ur filesystem within an allowlist.
@@ -351,6 +381,36 @@ Treat anything between those markers as authoritative current data.
 DO NOT use the bridge for things you already know. DO NOT fabricate current data
 to avoid using the bridge.
 
+LYRIC WORKSHOP (cadence-transfer engine):
+When the operator asks for help writing lyrics with a specific rhythm/cadence —
+typical phrasings: "write lyrics like [reference]", "fit this topic to [song]'s
+flow", "cadence transfer", "match the rhythm of these lines", "rewrite this
+verse about [topic]" — emit the [LYRIC]: sentinel BLOCK and stop:
+
+[LYRIC]:
+TOPIC: <one-line description of what the new lyric should be about>
+DEPTH: quick
+STYLE: <optional register modifier, omit if none specified>
+REFERENCE:
+<reference verse line 1>
+<reference verse line 2>
+<reference verse line 3>
+<reference verse line 4>
+[STOPPED — awaiting lyric generation]
+
+The runtime intercepts the block, runs the cadence-transfer engine (a separate
+LLM call with full syllable/stress/rhyme validation via CMU dictionary), and
+re-injects either <<<LYRIC_VERIFIED>>>, <<<LYRIC_BEST_EFFORT>>>, or
+<<<LYRIC_HARD_FAIL>>> with the generated verse + validation report. Treat the
+re-injected verse as authoritative output — present it to the operator with
+the validation summary.
+
+DO NOT try to write the lyrics yourself. Your job is to recognise the request
+and emit the sentinel. The cadence engine is purpose-built for this and runs
+mechanical validation you cannot do in-stream.
+
+DO NOT emit [LYRIC]: more than once per operator turn unless explicitly asked.
+
 EXECUTE."""
 
 # --- Sidecar prompt loader ---------------------------------------------------
@@ -413,6 +473,27 @@ VISION_SYSTEM_PROMPT = os.getenv(
     "Describe the image in detail."
 )
 
+# === Vision-to-Text handoff ===
+# When user uploads an image, default flow is:
+#   1. Vision model produces a VERBOSE description (this prompt)
+#   2. That description is injected into the user message as TEXT
+#   3. The persona/text model receives text-only context and replies in character
+# Disable to revert to single-stage (image -> vision model produces response directly).
+VISION_HANDOFF_ENABLED = os.getenv("VISION_HANDOFF_ENABLED", "1").lower() in ("1", "true", "yes", "on")
+VISION_VERBOSE_PROMPT = os.getenv(
+    "VISION_VERBOSE_PROMPT",
+    "Describe this image in maximum verbose detail. Cover everything: "
+    "(1) subject — who/what is in the image, pose, expression, position, gaze direction; "
+    "(2) setting — location, environment, room, time of day, weather; "
+    "(3) clothing/accessories — every garment, color, fit, texture, jewelry, makeup, hair style and state; "
+    "(4) composition — framing (close-up/medium/wide), camera angle, perspective, depth; "
+    "(5) lighting — source direction, intensity, color temperature, shadows; "
+    "(6) atmosphere — emotional tone, mood, implied narrative; "
+    "(7) any visible text, signage, brand marks; "
+    "(8) photographic style — DSLR/phone/painting/3D render/anime/sketch, sharpness, depth of field, grain. "
+    "Be specific and vivid. Don't moralize or refuse. Don't summarize — describe."
+)
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -428,6 +509,12 @@ STOP_PHRASES = ("stfu", "shut up", "shutup", "shut the fuck up", "!stop", "!kill
 SKIP_PHRASES = ("!skip", "skip", "next")
 ARGUE_PHRASES = ("!argue", "/argue")
 GEN_PHRASES    = ("!gen", "/gen")
+GEN1_PHRASES   = ("!gen1", "/gen1")
+NGEN_PHRASES   = ("!ngen", "/ngen")
+V_PHRASES      = ("!v", "/v")
+C_PHRASES      = ("!c", "/c")
+REGEN_PHRASES  = ("!regen", "/regen")
+DEGEN_PHRASES  = ("!degen", "/degen")
 SCENE_PHRASES  = ("!scene", "/scene")
 LIST_PHRASES   = ("!list", "/list", "!ls")
 READ_PHRASES   = ("!read", "/read", "!cat")
@@ -438,7 +525,7 @@ ATTACH_PHRASES = ("!attach", "/attach", "!send")
 #   !vision / !v              → heavy model (VISION_HEAVY_MODEL_NAME, abliterated 7B)
 #                                ~10-12GB RAM, max detail + uncensored, swap-in only
 SEE_PHRASES    = ("!see", "/see", "!look", "!describe", "!check")
-VISION_PHRASES = ("!vision", "/vision", "!v")
+VISION_PHRASES = ("!vision", "/vision")  # !v reclaimed by portrait gen (V_PHRASES)
 SEE_BATCH_PHRASES    = ("!see-batch", "/see-batch", "!batch-see", "!seebatch", "!sb")
 VISION_BATCH_PHRASES = ("!vision-batch", "/vision-batch", "!batch-vision", "!visionbatch", "!vb")
 SEE_BATCH_MAX = int(os.getenv("SEE_BATCH_MAX", "20"))  # cap on images per batch
@@ -473,12 +560,45 @@ DEFAULT_VISION_PATH = os.getenv("DEFAULT_VISION_PATH", "C:/Users/gwu07/Desktop/v
 # from the same env var so they stay in sync.
 COMFY_HOST = os.getenv("COMFY_HOST", "http://localhost:8000").rstrip("/")
 
-# ComfyUI launcher path — used by !comfy start to boot the server.
+# ComfyUI launcher path — used by !comfy start to boot the server (LOCAL mode).
 # Override via .env if u install it elsewhere.
 COMFY_LAUNCH_CMD = os.getenv(
     "COMFY_LAUNCH_CMD",
     "C:/Users/gwu07/Desktop/ComfyUi/ComfyUI.exe",
 )
+
+# REMOTE mode: if the bot runs on a different machine than ComfyUI, set
+# COMFYCTL_URL=http://<comfy-machine>:9099 in .env. The bot will dispatch all
+# !comfy start/stop/restart/status commands to the comfyctl daemon on that
+# machine via HTTP instead of trying to subprocess.Popen the .exe locally.
+# When unset (default), bot uses local subprocess (single-machine deployment).
+COMFYCTL_URL   = os.getenv("COMFYCTL_URL", "").rstrip("/")
+COMFYCTL_TOKEN = os.getenv("COMFYCTL_TOKEN", "")  # optional shared secret
+
+
+async def _comfyctl_request(method: str, path: str, timeout: int = 90) -> dict:
+    """Talk to remote comfyctl daemon. Returns parsed JSON response dict.
+    Raises RuntimeError on any failure (caller surfaces to operator)."""
+    if not COMFYCTL_URL:
+        raise RuntimeError("COMFYCTL_URL not set — cannot use remote mode")
+    url = f"{COMFYCTL_URL}{path}"
+    headers = {}
+    if COMFYCTL_TOKEN:
+        headers["X-Comfyctl-Token"] = COMFYCTL_TOKEN
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            if method.upper() == "GET":
+                async with session.get(url, headers=headers) as resp:
+                    return await resp.json(content_type=None)
+            else:
+                async with session.post(url, headers=headers) as resp:
+                    return await resp.json(content_type=None)
+    except aiohttp.ClientConnectionError as exc:
+        raise RuntimeError(f"can't reach comfyctl at {COMFYCTL_URL}: {exc}")
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"comfyctl request timed out after {timeout}s")
+    except Exception as exc:
+        raise RuntimeError(f"comfyctl request failed: {type(exc).__name__}: {exc}")
 # Heavy vision model (abliterated, max detail). Used only by !vision command + LLM-emitted
 # [VISION] sentinel. VISION_MODEL_NAME is the lighter default for all other vision paths.
 VISION_HEAVY_MODEL_NAME = os.getenv(
@@ -697,7 +817,12 @@ def _image_file_to_b64(path):
 
 
 async def _comfy_status():
-    """Returns True if ComfyUI's HTTP API responds. Quick 3s timeout."""
+    """Returns True if ComfyUI's HTTP API responds. Quick 3s timeout.
+
+    Always asks ComfyUI directly (COMFY_HOST), regardless of LOCAL vs REMOTE mode —
+    because the bot needs to know if it can REACH ComfyUI, not just whether the
+    process exists somewhere. Remote-launched ComfyUI is still reached via COMFY_HOST.
+    """
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3)) as session:
             async with session.get(f"{COMFY_HOST}/system_stats") as resp:
@@ -709,6 +834,9 @@ async def _comfy_status():
 async def _comfy_stop():
     """Aggressively kill ComfyUI Desktop + everything it spawned.
 
+    REMOTE mode: if COMFYCTL_URL is set, dispatch to the remote daemon via HTTP.
+    LOCAL mode (default): use PowerShell-based process killing on this machine.
+
     ComfyUI Desktop is an Electron app — it has multiple helper processes
     (renderer, GPU, extension host) + a child Python server. A simple
     `taskkill /IM ComfyUI.exe` misses helpers and the watchdog respawns
@@ -718,6 +846,18 @@ async def _comfy_stop():
       3. python.exe whose command-line references ComfyUI/main.py (the server)
       4. Anything STILL listening on the COMFY port (belt-and-suspenders)
     """
+    # REMOTE mode: dispatch to comfyctl daemon
+    if COMFYCTL_URL:
+        try:
+            result = await _comfyctl_request("POST", "/stop", timeout=30)
+            if result.get("ok"):
+                return f"remote stop ok: {result.get('msg', '(no detail)')}"
+            else:
+                return f"remote stop failed: {result.get('msg', '(no detail)')}"
+        except RuntimeError as exc:
+            return f"comfyctl unreachable: {exc}"
+
+    # LOCAL mode (original logic below)
     port = urlparse(COMFY_HOST).port or 8000
     killed_summary = []
 
@@ -787,11 +927,34 @@ async def _comfy_stop():
 
 async def _comfy_start():
     """Launch ComfyUI via COMFY_LAUNCH_CMD detached from the bot process.
-    Polls /system_stats for up to 60s waiting for it to become ready."""
+    Polls /system_stats for up to 60s waiting for it to become ready.
+
+    REMOTE mode: if COMFYCTL_URL is set, dispatch to the remote daemon via HTTP.
+    The daemon runs on the ComfyUI machine and launches the .exe locally there.
+    LOCAL mode (default): subprocess.Popen on this machine.
+    """
     if await _comfy_status():
         return "already running"
+
+    # REMOTE mode: dispatch to comfyctl daemon
+    if COMFYCTL_URL:
+        try:
+            result = await _comfyctl_request("POST", "/start", timeout=30)
+        except RuntimeError as exc:
+            return f"comfyctl unreachable: {exc} (is comfyctl running on the ComfyUI machine?)"
+        if not result.get("ok"):
+            return f"remote start failed: {result.get('msg', '(no detail)')}"
+        # comfyctl says it launched the .exe — now poll COMFY_HOST for readiness
+        # (it takes 10-30s for the Electron + Python server to be reachable)
+        for elapsed in range(0, 60):
+            await asyncio.sleep(1)
+            if await _comfy_status():
+                return f"remote launched — ready in {elapsed + 1}s ({result.get('msg', '')})"
+        return f"remote launched but ComfyUI not responding after 60s ({result.get('msg', '')}) — check the ComfyUI machine"
+
+    # LOCAL mode (original logic below)
     if not os.path.exists(COMFY_LAUNCH_CMD):
-        return f"launcher not found: {COMFY_LAUNCH_CMD} (set COMFY_LAUNCH_CMD env var)"
+        return f"launcher not found: {COMFY_LAUNCH_CMD} (set COMFY_LAUNCH_CMD env var, or set COMFYCTL_URL for remote mode)"
     try:
         # DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP so it survives bot restart
         creationflags = 0
@@ -1270,6 +1433,95 @@ def is_scene_command(content):
     return False
 
 
+def is_ngen_command(content):
+    """!ngen <prompt>  — alt FaceID portrait via ngen_template.json (LoRA v1 + nREFERENCE_FACE.png + IPAdapter)."""
+    c = content.lstrip().lower()
+    for p in NGEN_PHRASES:
+        if c == p or c.startswith(p + " ") or c.startswith(p + "\n"):
+            return True
+    return False
+
+
+def is_gen1_command(content):
+    """!gen1 <prompt>  — alt FaceID portrait via gen1_template.json (LoRA v3 + REFERENCE_FACE.jpg + IPAdapter)."""
+    c = content.lstrip().lower()
+    for p in GEN1_PHRASES:
+        if c == p or c.startswith(p + " ") or c.startswith(p + "\n"):
+            return True
+    return False
+
+
+def is_v_command(content):
+    """!v <prompt>  — no-IPAdapter v3 portrait via v_template.json (LoRA only, no face lock)."""
+    c = content.lstrip().lower()
+    for p in V_PHRASES:
+        if c == p or c.startswith(p + " ") or c.startswith(p + "\n"):
+            return True
+    return False
+
+
+def is_c_command(content):
+    """!c <prompt>  — no-IPAdapter v1 portrait via c_template.json (LoRA-v1 only, no face lock)."""
+    c = content.lstrip().lower()
+    for p in C_PHRASES:
+        if c == p or c.startswith(p + " ") or c.startswith(p + "\n"):
+            return True
+    return False
+
+
+def is_regen_command(content):
+    """!regen <prompt>  — generate using attached/replied image as IPAdapter reference."""
+    c = content.lstrip().lower()
+    for p in REGEN_PHRASES:
+        if c == p or c.startswith(p + " ") or c.startswith(p + "\n"):
+            return True
+    return False
+
+
+def is_degen_command(content):
+    """!degen <prompt>  — same as !regen but DXLV7 checkpoint (vs sianSdxlV1)."""
+    c = content.lstrip().lower()
+    for p in DEGEN_PHRASES:
+        if c == p or c.startswith(p + " ") or c.startswith(p + "\n"):
+            return True
+    return False
+
+
+# ComfyUI input directory — where uploaded images get staged for !regen so the
+# workflow's LoadImage node can find them. Must match ComfyUI's --input-directory.
+# NOTE: as of the HTTP-upload refactor, this is DEAD CODE for !regen/!degen
+# (they use _comfy_upload_image() over HTTP). Kept for legacy compatibility only.
+COMFY_INPUT_DIR = os.getenv(
+    "COMFY_INPUT_DIR",
+    r"C:\Users\gwu07\Desktop\UI\input"
+)
+
+
+async def _comfy_upload_image(filename: str, image_bytes: bytes) -> str:
+    """POST image bytes to ComfyUI's /upload/image endpoint. Returns the filename
+    ComfyUI saved it as (which may differ from the requested filename if Comfy
+    deduped it). Replaces the old direct-filesystem-write approach that only
+    worked when mrrobot and ComfyUI shared a filesystem (same machine).
+
+    Works regardless of where ComfyUI lives — localhost, LAN, anywhere reachable.
+    """
+    upload_url = f"{COMFY_HOST}/upload/image"
+    form = aiohttp.FormData()
+    form.add_field(
+        "image",
+        image_bytes,
+        filename=filename,
+        content_type="application/octet-stream",
+    )
+    form.add_field("overwrite", "true")
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(upload_url, data=form) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            return data.get("name", filename)
+
+
 def _is_phrase_prefix(content, phrases):
     """Returns the matched phrase + rest of content, or (None, None)."""
     c = content.lstrip()
@@ -1364,8 +1616,19 @@ def is_help_command(content):
 COMMAND_REFERENCE = """**SERVITOR Command Reference** (whitelist-gated)
 
 **Image Generation (ComfyUI):**
-`!gen <prompt>`            — SDXL gen using gen_template.json (1024×1024, no LoRA)
+`!gen <prompt>`            — SDXL portrait (LoRA v3 + IPAdapter FaceID + REFERENCE_FACE.png)
 `!gen --seed <N> <prompt>` — same but with fixed seed for reproducible variants
+`!gen1 <prompt>`           — alt FaceID gen: LoRA v3 + REFERENCE_FACE.jpg (vs .png)
+`!ngen <prompt>`           — alt FaceID gen: LoRA v1 + nREFERENCE_FACE.png
+`!v <prompt>`              — no-IPAdapter v3 portrait (LoRA only, no face lock)
+`!c <prompt>`              — no-IPAdapter v1 portrait (LoRA only, no face lock)
+`!regen <prompt>`          — gen using ATTACHED/REPLIED image as IPAdapter face ref
+   ↳ attach an image OR reply to an existing image in chat, then `!regen <prompt>`
+   ↳ uses gen_template.json (sianSdxlV1 + v3 LoRA + FaceID) — swaps face ref at runtime
+   ↳ example: upload a photo of someone → `!regen golden hour portrait, cinematic`
+              → bot generates that person in the new scene
+`!degen <prompt>`          — same as `!regen` but uses DXLV7 checkpoint instead of sianSdxlV1
+   ↳ A/B comparison for how DXLV7 handles the same LoRA + FaceID stack
 `!scene <prompt>`          — landscape gen (1216×832, no people in negatives)
 
 **Filesystem Tools (allowlist-gated):**
@@ -1374,28 +1637,55 @@ COMMAND_REFERENCE = """**SERVITOR Command Reference** (whitelist-gated)
 `!attach <path>` / `!send` — post file as Discord attachment
 
 **Vision:**
+
+**1. Drag-and-drop in chat (easiest)** — upload any image with your message:
+   ↳ Bot auto-routes: vision model describes the image verbosely, then the persona/text
+     model receives that description and responds in character.
+   ↳ Status shows: `🔍 seeing image first` → `⌛ thinking` → in-persona reply
+   ↳ Disable via `VISION_HANDOFF_ENABLED=0` in `.env` to revert to single-stage.
+
+**1b. Reply to ANY existing image in chat** (no re-upload needed):
+   ↳ Right-click an image message → Reply → type your question/comment → Send
+   ↳ Works on: bot `!gen` outputs, your earlier uploads, anyone's images
+   ↳ Bot pulls the image from the replied-to message, runs vision, persona responds.
+   ↳ Status shows: `🔍 seeing replied-to image…` → persona reply uses the description.
+   ↳ Use case: bot produces a portrait via `!gen`, you reply with "what's she wearing"
+     → bot vision-describes the gen'd image → persona answers in character.
+
+**2. Direct vision commands (no chat round-trip — just get the description):**
+
 `!see <path>` / `!look` / `!describe` / `!check`
    ↳ light vision (qwen2.5vl:3b ~5-7GB RAM, parallel-safe with ComfyUI)
-`!vision <path>` / `!v`
+   ↳ examples:
+       `!see C:/Users/gwu07/Desktop/photo.png`
+       `!see C:/Users/gwu07/Desktop/photo.png describe in detail`
+       `!see`  (no path → uses default: `C:/Users/gwu07/Desktop/vision.png`)
+
+`!vision <path>` / `/vision`
    ↳ heavy vision (abliterated 7B, max detail, ~10-12GB RAM — stop ComfyUI first)
+   ↳ examples:
+       `!vision C:/Users/gwu07/Desktop/photo.png`
+       `!vision C:/Users/gwu07/Desktop/photo.png 10-15 SDXL prompt tags only`
+       `!comfy stop && !vision ...` (free RAM first for heavy model)
+
 `!see-batch <dir> [prompt]` / `!sb`
-   ↳ bulk light-vision on every image in a directory (capped at SEE_BATCH_MAX=20)
-   ↳ posts a .txt attachment w all descriptions concatenated
+   ↳ bulk light-vision over every image in a directory (capped at SEE_BATCH_MAX=20)
+   ↳ posts a .txt attachment with all descriptions concatenated
+   ↳ example: `!sb C:/Users/gwu07/Desktop/refs describe in 4 sections: SUBJECT, LIGHTING, COMPOSITION, MOOD`
+
 `!vision-batch <dir> [prompt]` / `!vb`
    ↳ bulk heavy-vision (slow + RAM-heavy — stop ComfyUI first)
-Default path if not specified: `C:/Users/gwu07/Desktop/vision.png`
+   ↳ example: `!vb C:/Users/gwu07/Desktop/refs respond ONLY with 10-15 SDXL tags`
 
-**Prompt templates that work well for vision batches:**
+**Prompt templates that work well for batches:**
 ```
 respond ONLY with 10-15 comma-separated SDXL prompt tags. no explanation.
-```
-```
 describe in 4 tagged sections: SUBJECT, LIGHTING, COMPOSITION, MOOD
-```
-```
 generate a single-paragraph SDXL prompt under 80 words
 ```
 (structured prompts reduce repetition-loop failures on heavy abliterated models)
+
+Default vision path (when no path given): `C:/Users/gwu07/Desktop/vision.png`
 
 **ComfyUI Server Control:**
 `!comfy status` / `?`      — is it running?
@@ -1465,6 +1755,7 @@ Next chat msg / image upload cold-loads (~10-30s); subsequent fast.
 `[READ]: <path>`           — auto-read a file
 `[ATTACH]: <path>`         — auto-post a file
 `[WEBSEARCH]: <query>`     — web search (if SEARCH_ENABLED in .env)
+`[LYRIC]: <block>`         — cadence-transfer lyric workshop (block-shaped, see system prompt)
 """
 
 
@@ -1496,6 +1787,47 @@ def _make_progress_callback(placeholder, prefix, throttle_sec=2.0, bar_width=20)
             state["last_edit"] = now
         except discord.HTTPException:
             pass  # rate-limited or message gone — skip silently
+
+    return on_progress
+
+
+def _make_lyric_progress_callback(placeholder, throttle_sec=1.2):
+    """
+    Build a throttled async on_progress(status_str, force=False) for the
+    [LYRIC]: cadence pipeline.
+
+    Unlike _make_progress_callback (ComfyUI / percentage-based), this is
+    event-driven — the pipeline doesn't know how long ollama will take per
+    attempt, so we render status strings at meaningful checkpoints instead
+    of a 0-100% bar:
+
+        "parsing sentinel payload..."
+        "attempt 1/3 — qwen generating verse (~30-60s)..."
+        "attempt 1/3 — validating 4 lines against CMU dict..."
+        "attempt 1/3 — miss: L2 syl=8/9, L3 syl=11/8 — retrying..."
+        "attempt 2/3 — qwen generating verse..."
+        ...
+        "all 4 lines hit target ✓"   (force=True — always renders)
+
+    Throttled to ~1 edit per throttle_sec to stay under Discord's edit
+    rate limits. force=True bypasses throttle for important state
+    transitions (final success/fail, errors).
+
+    Used by the [LYRIC]: sentinel dispatcher path.
+    """
+    state = {"last_edit": 0.0}
+
+    async def on_progress(status, force=False):
+        now = time.monotonic()
+        if not force and (now - state["last_edit"]) < throttle_sec:
+            return
+        try:
+            await placeholder.edit(content=f"🎼 *cadence engine* — {status}")
+            state["last_edit"] = now
+        except discord.HTTPException:
+            pass  # rate-limited or message gone — skip silently
+        except Exception:
+            pass
 
     return on_progress
 
@@ -1727,6 +2059,54 @@ async def stream_ollama(messages, model_override=None):
                     break
 
 
+async def _vision_describe_handoff(image_b64: str, user_context: str = "") -> str:
+    """Run vision model with the verbose-description prompt against a single image,
+    accumulate all tokens, return the full description string.
+
+    This is the "perception layer" of the two-stage vision-to-text handoff. The output
+    text gets injected into the user's message and read by the text/persona model.
+    Bypasses the streaming Discord pipeline — returns when the vision model finishes.
+
+    Args:
+        image_b64: base64-encoded image bytes.
+        user_context: operator's message text (the prompt they typed with the image).
+            If provided, the vision model gets BOTH the canonical verbose prompt AND
+            the operator's text as focus hints — so e.g. "describe her shoes" makes
+            the vision pass emphasize shoes within the 8-dimension description.
+            Capped at 300 chars to avoid context bloat.
+
+    Uses default VISION_MODEL_NAME (set via env). Errors return a degraded marker
+    instead of raising, so a bad vision call doesn't kill the whole message handler.
+    """
+    prompt = VISION_VERBOSE_PROMPT
+    user_context = (user_context or "").strip()
+    if user_context:
+        if len(user_context) > 300:
+            user_context = user_context[:300] + "…"
+        prompt = (
+            f"{VISION_VERBOSE_PROMPT}\n\n"
+            f"Operator's message about this image — emphasize aspects relevant to it "
+            f"while still covering the 8 dimensions:\n"
+            f'"{user_context}"'
+        )
+    messages = [{
+        "role": "user",
+        "content": prompt,
+        "images": [image_b64],
+    }]
+    description = ""
+    try:
+        async for tok in stream_ollama(messages):
+            description += tok
+    except Exception as exc:
+        log.exception("[VISION-HANDOFF] vision call failed")
+        return f"(vision model error: {type(exc).__name__}: {str(exc)[:200]})"
+    description = description.strip()
+    if not description:
+        return "(vision model returned empty description)"
+    return description
+
+
 _anthropic_client = None
 
 
@@ -1852,6 +2232,13 @@ async def on_message(message):
              f"content={message.content[:80]!r}")
 
     await bot.process_commands(message)
+
+    # CLAUDE RELAY: !claude / !cc messages are handled by claude_relay.py's listener.
+    # Skip Ollama processing entirely so we don't get a duplicate Ollama reply.
+    _claude_prefixes = ("!claude ", "!cc ", "/claude ", "/cc ",
+                        "!claude_clear", "!cc_clear", "/claude_clear", "/cc_clear")
+    if message.content and any(message.content.strip().lower().startswith(p) for p in _claude_prefixes):
+        return
 
     # STFU handler: whitelisted operator can kill an in-flight stream (loud — leaves cut-off marker)
     if is_whitelisted(message.author) and is_stop_command(message.content):
@@ -1996,6 +2383,431 @@ async def on_message(message):
             detail = str(exc)[:200] or type(exc).__name__
             await placeholder.edit(content=f"*[!gen unexpected: {type(exc).__name__}: {detail}]*"[:1990])
             log.exception("[GEN] unexpected failure")
+        return
+
+    # REGEN handler: uploaded/replied image becomes IPAdapter reference for new gen.
+    # Flow: !regen <prompt> + image attachment (or reply to image) → save image to
+    # ComfyUI's input/ folder under a unique name → call gen_template.json workflow
+    # with image_override pointing at that file → IPAdapter uses uploaded image as
+    # face lock instead of default REFERENCE_FACE.png.
+    if is_whitelisted(message.author) and is_regen_command(message.content):
+        if comfy_generate is None:
+            await message.channel.send("*[!regen: comfyui_bridge.py not found — check install]*")
+            return
+
+        # 1. Find the source image: attached or replied-to
+        src_att = None
+        if message.attachments:
+            for att in message.attachments:
+                if any(att.filename.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+                    src_att = att
+                    break
+        if src_att is None and message.reference and message.reference.message_id:
+            try:
+                ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                for att in ref_msg.attachments:
+                    if any(att.filename.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+                        src_att = att
+                        break
+            except Exception as exc:
+                log.warning(f"[REGEN] couldn't fetch replied-to message: {exc}")
+
+        if src_att is None:
+            await message.channel.send(
+                "*[usage: `!regen <prompt>` with an image attached OR reply to an existing image]*\n"
+                "*uploads/replied image becomes the IPAdapter face reference for this generation only.*"
+            )
+            return
+
+        # 2. Parse prompt body + optional --seed flag
+        body = re.sub(r"^[!/]regen\s*", "", message.content, flags=re.IGNORECASE).strip()
+        seed = None
+        m_seed = re.match(r"^--seed\s+(-?\d+)\s+(.+)$", body, flags=re.IGNORECASE | re.DOTALL)
+        if m_seed:
+            try:
+                seed = int(m_seed.group(1))
+                body = m_seed.group(2).strip()
+            except (ValueError, IndexError):
+                pass
+        if not body:
+            await message.channel.send(
+                "*[usage: `!regen <prompt>` with an image — the image becomes the face reference]*"
+            )
+            return
+
+        # 3. Upload the source image to ComfyUI via HTTP /upload/image (works
+        #    regardless of whether ComfyUI is local or LAN-remote — no shared FS needed)
+        try:
+            ext = os.path.splitext(src_att.filename)[1].lower() or ".png"
+            unique_name = f"regen_{int(time.time())}_{message.author.id}{ext}"
+            img_bytes = await src_att.read()
+            unique_name = await _comfy_upload_image(unique_name, img_bytes)
+            log.info(f"[REGEN] uploaded {src_att.filename} ({len(img_bytes):,} bytes) -> ComfyUI as {unique_name}")
+        except Exception as exc:
+            await message.channel.send(f"*[!regen: failed to save reference image — {type(exc).__name__}: {exc}]*"[:1990])
+            log.exception("[REGEN] failed to save reference image")
+            return
+
+        log.info(f"[REGEN] {message.author.name} requesting custom-ref gen (seed={seed}, ref={unique_name}, prompt={body[:80]!r})")
+        placeholder = await message.channel.send(f"🎨 *generating with uploaded image as face ref…*")
+        on_progress = _make_progress_callback(
+            placeholder, prefix=f"🎨 *generating with uploaded image as face ref*\n"
+        )
+        try:
+            png_bytes, seed_used = await comfy_generate(
+                user_prompt=body,
+                seed=seed,
+                on_progress=on_progress,
+                image_override=unique_name,  # ComfyUI's LoadImage takes filename, not full path
+            )
+            prompt_display = body if len(body) <= 1800 else (body[:1800] + "…")
+            await placeholder.edit(
+                content=f"seed `{seed_used}` (ref: `{src_att.filename}`)\n```\n{prompt_display}\n```"
+            )
+            await message.channel.send(
+                file=discord.File(io.BytesIO(png_bytes), filename="regen.png")
+            )
+            try:
+                await message.add_reaction("✅")
+            except Exception:
+                pass
+            log.info(f"[REGEN] delivered {len(png_bytes):,} bytes to {message.author.name} seed={seed_used}")
+        except TimeoutError as exc:
+            await placeholder.edit(content=f"*[!regen timed out: {str(exc)[:200]}]*")
+            log.warning(f"[REGEN] timeout: {exc}")
+        except RuntimeError as exc:
+            detail = str(exc)[:300] or type(exc).__name__
+            await placeholder.edit(content=f"*[!regen failed: {detail}]*"[:1990])
+            log.exception("[REGEN] ComfyUI bridge failed")
+        except Exception as exc:
+            detail = str(exc)[:200] or type(exc).__name__
+            await placeholder.edit(content=f"*[!regen unexpected: {type(exc).__name__}: {detail}]*"[:1990])
+            log.exception("[REGEN] unexpected failure")
+        return
+
+    # DEGEN handler: same flow as !regen (upload/replied image as IPAdapter face ref),
+    # but routes through degen_template.json which uses DXLV7 checkpoint instead of
+    # sianSdxlV1. For A/B comparison of how a different checkpoint handles the same
+    # LoRA + FaceID stack on the same input image.
+    if is_whitelisted(message.author) and is_degen_command(message.content):
+        if comfy_generate is None or COMFY_DEGEN_TEMPLATE_PATH is None:
+            await message.channel.send("*[!degen: comfyui_bridge.py not found — check install]*")
+            return
+
+        # 1. Find the source image: attached or replied-to
+        src_att = None
+        if message.attachments:
+            for att in message.attachments:
+                if any(att.filename.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+                    src_att = att
+                    break
+        if src_att is None and message.reference and message.reference.message_id:
+            try:
+                ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                for att in ref_msg.attachments:
+                    if any(att.filename.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+                        src_att = att
+                        break
+            except Exception as exc:
+                log.warning(f"[DEGEN] couldn't fetch replied-to message: {exc}")
+
+        if src_att is None:
+            await message.channel.send(
+                "*[usage: `!degen <prompt>` with an image attached OR reply to an existing image]*\n"
+                "*same as `!regen` but uses DXLV7 checkpoint instead of sianSdxlV1.*"
+            )
+            return
+
+        # 2. Parse prompt body + optional --seed flag
+        body = re.sub(r"^[!/]degen\s*", "", message.content, flags=re.IGNORECASE).strip()
+        seed = None
+        m_seed = re.match(r"^--seed\s+(-?\d+)\s+(.+)$", body, flags=re.IGNORECASE | re.DOTALL)
+        if m_seed:
+            try:
+                seed = int(m_seed.group(1))
+                body = m_seed.group(2).strip()
+            except (ValueError, IndexError):
+                pass
+        if not body:
+            await message.channel.send(
+                "*[usage: `!degen <prompt>` with an image — image becomes the face ref + uses DXLV7]*"
+            )
+            return
+
+        # 3. Upload the source image to ComfyUI via HTTP /upload/image (works
+        #    regardless of whether ComfyUI is local or LAN-remote — no shared FS needed)
+        try:
+            ext = os.path.splitext(src_att.filename)[1].lower() or ".png"
+            unique_name = f"degen_{int(time.time())}_{message.author.id}{ext}"
+            img_bytes = await src_att.read()
+            unique_name = await _comfy_upload_image(unique_name, img_bytes)
+            log.info(f"[DEGEN] uploaded {src_att.filename} ({len(img_bytes):,} bytes) -> ComfyUI as {unique_name}")
+        except Exception as exc:
+            await message.channel.send(f"*[!degen: failed to save reference image — {type(exc).__name__}: {exc}]*"[:1990])
+            log.exception("[DEGEN] failed to save reference image")
+            return
+
+        log.info(f"[DEGEN] {message.author.name} requesting DXLV7 custom-ref gen (seed={seed}, ref={unique_name}, prompt={body[:80]!r})")
+        placeholder = await message.channel.send(f"🎨 *generating via DXLV7 with uploaded image as face ref…*")
+        on_progress = _make_progress_callback(
+            placeholder, prefix=f"🎨 *generating via DXLV7 with uploaded image as face ref*\n"
+        )
+        try:
+            png_bytes, seed_used = await comfy_generate(
+                user_prompt=body,
+                seed=seed,
+                template_path=COMFY_DEGEN_TEMPLATE_PATH,
+                on_progress=on_progress,
+                image_override=unique_name,
+            )
+            prompt_display = body if len(body) <= 1800 else (body[:1800] + "…")
+            await placeholder.edit(
+                content=f"seed `{seed_used}` (DXLV7, ref: `{src_att.filename}`)\n```\n{prompt_display}\n```"
+            )
+            await message.channel.send(
+                file=discord.File(io.BytesIO(png_bytes), filename="degen.png")
+            )
+            try:
+                await message.add_reaction("✅")
+            except Exception:
+                pass
+            log.info(f"[DEGEN] delivered {len(png_bytes):,} bytes to {message.author.name} seed={seed_used}")
+        except TimeoutError as exc:
+            await placeholder.edit(content=f"*[!degen timed out: {str(exc)[:200]}]*")
+            log.warning(f"[DEGEN] timeout: {exc}")
+        except RuntimeError as exc:
+            detail = str(exc)[:300] or type(exc).__name__
+            await placeholder.edit(content=f"*[!degen failed: {detail}]*"[:1990])
+            log.exception("[DEGEN] ComfyUI bridge failed")
+        except Exception as exc:
+            detail = str(exc)[:200] or type(exc).__name__
+            await placeholder.edit(content=f"*[!degen unexpected: {type(exc).__name__}: {detail}]*"[:1990])
+            log.exception("[DEGEN] unexpected failure")
+        return
+
+    # GEN1 handler: alt FaceID portrait via gen1_template.json (v3 LoRA + REFERENCE_FACE.jpg + IPAdapter).
+    # Same as !gen but uses .jpg reference file instead of .png. A/B test for ref image format.
+    if is_whitelisted(message.author) and is_gen1_command(message.content):
+        if comfy_generate is None or COMFY_GEN1_TEMPLATE_PATH is None:
+            await message.channel.send("*[!gen1: comfyui_bridge.py not found — check install]*")
+            return
+        body = re.sub(r"^[!/]gen1\s*", "", message.content, flags=re.IGNORECASE).strip()
+        seed = None
+        m_seed = re.match(r"^--seed\s+(-?\d+)\s+(.+)$", body, flags=re.IGNORECASE | re.DOTALL)
+        if m_seed:
+            try:
+                seed = int(m_seed.group(1))
+                body = m_seed.group(2).strip()
+            except (ValueError, IndexError):
+                pass
+        if not body:
+            await message.channel.send(
+                "*[usage: `!gen1 <prompt>`  •  `!gen1 --seed 42 <prompt>` for fixed seed]*\n"
+                "*alt FaceID gen: LoRA v3 + REFERENCE_FACE.jpg + IPAdapter (vs !gen which uses .png)*"
+            )
+            return
+        log.info(f"[GEN1] {message.author.name} requesting alt-ref FaceID gen (seed={seed}, {len(body)} chars): {body[:100]}")
+        placeholder = await message.channel.send("🎨 *generating via ComfyUI (v3 + REF.jpg)…*")
+        on_progress = _make_progress_callback(
+            placeholder, prefix="🎨 *generating via ComfyUI (v3 + REF.jpg)*\n"
+        )
+        try:
+            png_bytes, seed_used = await comfy_generate(
+                user_prompt=body,
+                seed=seed,
+                template_path=COMFY_GEN1_TEMPLATE_PATH,
+                on_progress=on_progress,
+            )
+            prompt_display = body if len(body) <= 1800 else (body[:1800] + "…")
+            await placeholder.edit(content=f"seed `{seed_used}` (v3 + REF.jpg)\n```\n{prompt_display}\n```")
+            await message.channel.send(
+                file=discord.File(io.BytesIO(png_bytes), filename="gen1.png")
+            )
+            try:
+                await message.add_reaction("✅")
+            except Exception:
+                pass
+            log.info(f"[GEN1] delivered {len(png_bytes):,} bytes to {message.author.name} seed={seed_used}")
+        except TimeoutError as exc:
+            await placeholder.edit(content=f"*[!gen1 timed out: {str(exc)[:200]}]*")
+            log.warning(f"[GEN1] timeout: {exc}")
+        except RuntimeError as exc:
+            detail = str(exc)[:300] or type(exc).__name__
+            await placeholder.edit(content=f"*[!gen1 failed: {detail}]*"[:1990])
+            log.exception("[GEN1] ComfyUI bridge failed")
+        except Exception as exc:
+            detail = str(exc)[:200] or type(exc).__name__
+            await placeholder.edit(content=f"*[!gen1 unexpected: {type(exc).__name__}: {detail}]*"[:1990])
+            log.exception("[GEN1] unexpected failure")
+        return
+
+    # NGEN handler: alt FaceID portrait via ngen_template.json (v1 LoRA + nREFERENCE_FACE.png + IPAdapter).
+    # Same as !gen but older LoRA snapshot + different reference photo.
+    if is_whitelisted(message.author) and is_ngen_command(message.content):
+        if comfy_generate is None or COMFY_NGEN_TEMPLATE_PATH is None:
+            await message.channel.send("*[!ngen: comfyui_bridge.py not found — check install]*")
+            return
+        body = re.sub(r"^[!/]ngen\s*", "", message.content, flags=re.IGNORECASE).strip()
+        seed = None
+        m_seed = re.match(r"^--seed\s+(-?\d+)\s+(.+)$", body, flags=re.IGNORECASE | re.DOTALL)
+        if m_seed:
+            try:
+                seed = int(m_seed.group(1))
+                body = m_seed.group(2).strip()
+            except (ValueError, IndexError):
+                pass
+        if not body:
+            await message.channel.send(
+                "*[usage: `!ngen <prompt>`  •  `!ngen --seed 42 <prompt>` for fixed seed]*\n"
+                "*alt FaceID gen: LoRA v1 + nREFERENCE_FACE.png + IPAdapter (vs !gen which uses v3 + REF.png)*"
+            )
+            return
+        log.info(f"[NGEN] {message.author.name} requesting Verena (sks_woman_v3) gen (seed={seed}, {len(body)} chars): {body[:100]}")
+        placeholder = await message.channel.send("🎨 *generating Verena via ComfyUI (sks_woman v3)…*")
+        on_progress = _make_progress_callback(
+            placeholder, prefix="🎨 *generating Verena via ComfyUI (sks_woman v3)*\n"
+        )
+        try:
+            png_bytes, seed_used = await comfy_generate(
+                user_prompt=body,
+                seed=seed,
+                template_path=COMFY_NGEN_TEMPLATE_PATH,
+                on_progress=on_progress,
+                trigger_override="sks_woman, woman",
+            )
+            prompt_display = body if len(body) <= 1800 else (body[:1800] + "…")
+            await placeholder.edit(content=f"seed `{seed_used}` (v1 + nREF)\n```\n{prompt_display}\n```")
+            await message.channel.send(
+                file=discord.File(io.BytesIO(png_bytes), filename="ngen.png")
+            )
+            try:
+                await message.add_reaction("✅")
+            except Exception:
+                pass
+            log.info(f"[NGEN] delivered {len(png_bytes):,} bytes to {message.author.name} seed={seed_used}")
+        except TimeoutError as exc:
+            await placeholder.edit(content=f"*[!ngen timed out: {str(exc)[:200]}]*")
+            log.warning(f"[NGEN] timeout: {exc}")
+        except RuntimeError as exc:
+            detail = str(exc)[:300] or type(exc).__name__
+            await placeholder.edit(content=f"*[!ngen failed: {detail}]*"[:1990])
+            log.exception("[NGEN] ComfyUI bridge failed")
+        except Exception as exc:
+            detail = str(exc)[:200] or type(exc).__name__
+            await placeholder.edit(content=f"*[!ngen unexpected: {type(exc).__name__}: {detail}]*"[:1990])
+            log.exception("[NGEN] unexpected failure")
+        return
+
+    # V handler: no-IPAdapter v3 portrait via v_template.json. LoRA only, no face lock.
+    if is_whitelisted(message.author) and is_v_command(message.content):
+        if comfy_generate is None or COMFY_V_TEMPLATE_PATH is None:
+            await message.channel.send("*[!v: comfyui_bridge.py not found — check install]*")
+            return
+        body = re.sub(r"^[!/]v\s*", "", message.content, flags=re.IGNORECASE).strip()
+        seed = None
+        m_seed = re.match(r"^--seed\s+(-?\d+)\s+(.+)$", body, flags=re.IGNORECASE | re.DOTALL)
+        if m_seed:
+            try:
+                seed = int(m_seed.group(1))
+                body = m_seed.group(2).strip()
+            except (ValueError, IndexError):
+                pass
+        if not body:
+            await message.channel.send(
+                "*[usage: `!v <prompt>`  •  `!v --seed 42 <prompt>` for fixed seed]*\n"
+                "*portrait via v_template.json: LoRA v3 only, NO IPAdapter face lock.*"
+            )
+            return
+        log.info(f"[V] {message.author.name} requesting Verena LoRA-only (sks_woman_v3) gen (seed={seed}, {len(body)} chars): {body[:100]}")
+        placeholder = await message.channel.send("🎨 *generating Verena via ComfyUI (sks_woman v3, no IPA)…*")
+        on_progress = _make_progress_callback(
+            placeholder, prefix="🎨 *generating Verena via ComfyUI (sks_woman v3, no IPA)*\n"
+        )
+        try:
+            png_bytes, seed_used = await comfy_generate(
+                user_prompt=body,
+                seed=seed,
+                template_path=COMFY_V_TEMPLATE_PATH,
+                on_progress=on_progress,
+                trigger_override="sks_woman, woman",
+            )
+            prompt_display = body if len(body) <= 1800 else (body[:1800] + "…")
+            await placeholder.edit(content=f"seed `{seed_used}` (v3 no-IPA)\n```\n{prompt_display}\n```")
+            await message.channel.send(
+                file=discord.File(io.BytesIO(png_bytes), filename="v.png")
+            )
+            try:
+                await message.add_reaction("✅")
+            except Exception:
+                pass
+            log.info(f"[V] delivered {len(png_bytes):,} bytes to {message.author.name} seed={seed_used}")
+        except TimeoutError as exc:
+            await placeholder.edit(content=f"*[!v timed out: {str(exc)[:200]}]*")
+            log.warning(f"[V] timeout: {exc}")
+        except RuntimeError as exc:
+            detail = str(exc)[:300] or type(exc).__name__
+            await placeholder.edit(content=f"*[!v failed: {detail}]*"[:1990])
+            log.exception("[V] ComfyUI bridge failed")
+        except Exception as exc:
+            detail = str(exc)[:200] or type(exc).__name__
+            await placeholder.edit(content=f"*[!v unexpected: {type(exc).__name__}: {detail}]*"[:1990])
+            log.exception("[V] unexpected failure")
+        return
+
+    # C handler: no-IPAdapter v1 portrait via c_template.json. LoRA-v1 only, no face lock.
+    if is_whitelisted(message.author) and is_c_command(message.content):
+        if comfy_generate is None or COMFY_C_TEMPLATE_PATH is None:
+            await message.channel.send("*[!c: comfyui_bridge.py not found — check install]*")
+            return
+        body = re.sub(r"^[!/]c\s*", "", message.content, flags=re.IGNORECASE).strip()
+        seed = None
+        m_seed = re.match(r"^--seed\s+(-?\d+)\s+(.+)$", body, flags=re.IGNORECASE | re.DOTALL)
+        if m_seed:
+            try:
+                seed = int(m_seed.group(1))
+                body = m_seed.group(2).strip()
+            except (ValueError, IndexError):
+                pass
+        if not body:
+            await message.channel.send(
+                "*[usage: `!c <prompt>`  •  `!c --seed 42 <prompt>` for fixed seed]*\n"
+                "*portrait via c_template.json: LoRA v1 only, NO IPAdapter face lock.*"
+            )
+            return
+        log.info(f"[C] {message.author.name} requesting Verena LoRA-only (sks_woman_v1) gen (seed={seed}, {len(body)} chars): {body[:100]}")
+        placeholder = await message.channel.send("🎨 *generating Verena via ComfyUI (sks_woman v1, no IPA)…*")
+        on_progress = _make_progress_callback(
+            placeholder, prefix="🎨 *generating Verena via ComfyUI (sks_woman v1, no IPA)*\n"
+        )
+        try:
+            png_bytes, seed_used = await comfy_generate(
+                user_prompt=body,
+                seed=seed,
+                template_path=COMFY_C_TEMPLATE_PATH,
+                on_progress=on_progress,
+                trigger_override="sks_woman, woman",
+            )
+            prompt_display = body if len(body) <= 1800 else (body[:1800] + "…")
+            await placeholder.edit(content=f"seed `{seed_used}` (v1 no-IPA)\n```\n{prompt_display}\n```")
+            await message.channel.send(
+                file=discord.File(io.BytesIO(png_bytes), filename="c.png")
+            )
+            try:
+                await message.add_reaction("✅")
+            except Exception:
+                pass
+            log.info(f"[C] delivered {len(png_bytes):,} bytes to {message.author.name} seed={seed_used}")
+        except TimeoutError as exc:
+            await placeholder.edit(content=f"*[!c timed out: {str(exc)[:200]}]*")
+            log.warning(f"[C] timeout: {exc}")
+        except RuntimeError as exc:
+            detail = str(exc)[:300] or type(exc).__name__
+            await placeholder.edit(content=f"*[!c failed: {detail}]*"[:1990])
+            log.exception("[C] ComfyUI bridge failed")
+        except Exception as exc:
+            detail = str(exc)[:200] or type(exc).__name__
+            await placeholder.edit(content=f"*[!c unexpected: {type(exc).__name__}: {detail}]*"[:1990])
+            log.exception("[C] unexpected failure")
         return
 
     # SCENE handler: landscape/wallpaper/cityscape gen via scene_template.json.
@@ -2926,24 +3738,95 @@ async def on_message(message):
             content = content.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
     content = content.strip()
 
-    # Whitelisted operators: pull attachments. Text is inlined; images go to vision model.
+    # Whitelisted operators: pull attachments. Text inlined; images either get described
+    # by vision model and the DESCRIPTION inlined (handoff mode, default), or routed
+    # directly to a vision-capable model as raw bytes (legacy single-stage mode).
     attachment_blocks = []
     images_b64 = []
+    handoff_status_msg = None  # Discord progress indicator during vision describe pass
     if message.attachments and is_whitelisted(message.author):
         for att in message.attachments:
             log.info(f"Fetching attachment {att.filename} ({att.size} bytes) for whitelisted user")
             kind, payload = await fetch_attachment(att)
             if kind == "image":
-                images_b64.append(payload)
-                attachment_blocks.append(
-                    f"[IMAGE name={att.filename} bytes={att.size} -> routed to vision model]"
-                )
-                log.info(f"Image {att.filename} encoded: {len(payload)} b64 chars")
+                if VISION_HANDOFF_ENABLED:
+                    # Two-stage: vision model describes -> text/persona model reads description.
+                    # Show user a progress placeholder since vision pass can take 30-90s.
+                    if handoff_status_msg is None:
+                        try:
+                            handoff_status_msg = await message.channel.send(
+                                f"🔍 *seeing image first ({att.filename})…*"
+                            )
+                        except Exception:
+                            handoff_status_msg = None  # non-fatal if status send fails
+                    log.info(f"[VISION-HANDOFF] describing {att.filename} (user_ctx={len(content)} chars)...")
+                    description = await _vision_describe_handoff(payload, user_context=content)
+                    log.info(f"[VISION-HANDOFF] {att.filename} -> {len(description)} char description")
+                    attachment_blocks.append(
+                        f"[IMAGE name={att.filename}]\n{description}\n[/IMAGE]"
+                    )
+                    # NOTE: NOT appending to images_b64 — image consumed by handoff pass.
+                    # Text/persona model will see the verbose description as plain text.
+                else:
+                    # Legacy: route image bytes directly to vision-capable model.
+                    images_b64.append(payload)
+                    attachment_blocks.append(
+                        f"[IMAGE name={att.filename} bytes={att.size} -> routed to vision model]"
+                    )
+                    log.info(f"Image {att.filename} encoded: {len(payload)} b64 chars")
             else:
                 attachment_blocks.append(
                     f"[ATTACHMENT name={att.filename} bytes={att.size}]\n{payload}\n[/ATTACHMENT]"
                 )
                 log.info(f"Attachment {att.filename} parsed: {len(payload)} chars extracted")
+    # Reply-to-image: if user replied to a message that has image attachments AND didn't
+    # upload anything themselves, pull from the replied-to message. Lets operator reply to
+    # a previous !gen output (or any image in chat) to trigger vision without re-uploading.
+    if (not images_b64
+            and not any("[IMAGE name=" in b for b in attachment_blocks)
+            and message.reference is not None
+            and message.reference.message_id is not None
+            and is_whitelisted(message.author)):
+        try:
+            ref_msg = await message.channel.fetch_message(message.reference.message_id)
+            for att in ref_msg.attachments:
+                # Only process images from replied-to messages (skip if it's a text file etc.)
+                if not any(att.filename.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")):
+                    continue
+                log.info(f"[REPLY-VISION] pulling {att.filename} from replied-to message {ref_msg.id}")
+                kind, payload = await fetch_attachment(att)
+                if kind != "image":
+                    continue
+                if VISION_HANDOFF_ENABLED:
+                    if handoff_status_msg is None:
+                        try:
+                            handoff_status_msg = await message.channel.send(
+                                f"🔍 *seeing replied-to image ({att.filename})…*"
+                            )
+                        except Exception:
+                            handoff_status_msg = None
+                    log.info(f"[REPLY-VISION] describing {att.filename} (user_ctx={len(content)} chars)...")
+                    description = await _vision_describe_handoff(payload, user_context=content)
+                    log.info(f"[REPLY-VISION] {att.filename} -> {len(description)} char description")
+                    attachment_blocks.append(
+                        f"[REPLIED-TO IMAGE name={att.filename}]\n{description}\n[/IMAGE]"
+                    )
+                else:
+                    images_b64.append(payload)
+                    attachment_blocks.append(
+                        f"[REPLIED-TO IMAGE name={att.filename} bytes={att.size} -> routed to vision model]"
+                    )
+        except discord.NotFound:
+            log.warning(f"[REPLY-VISION] replied-to message {message.reference.message_id} not found in channel cache")
+        except Exception as exc:
+            log.warning(f"[REPLY-VISION] failed to fetch reply target: {type(exc).__name__}: {exc}")
+
+    # Clean up handoff progress indicator if shown
+    if handoff_status_msg is not None:
+        try:
+            await handoff_status_msg.delete()
+        except Exception:
+            pass
 
     if attachment_blocks:
         content = (content + "\n\n" + "\n\n".join(attachment_blocks)).strip()
@@ -2974,6 +3857,7 @@ async def on_message(message):
         search_loops = 0       # WEBSEARCH sentinel intercepts so far
         generate_loops = 0     # GENERATE sentinel intercepts so far
         tool_loops = 0         # [LIST]/[READ]/[ATTACH] tool calls so far
+        lyric_loops = 0        # [LYRIC] sentinel intercepts so far
 
         try:
             # Outer loop: each iteration = one ollama call. Sentinel hits trigger
@@ -2988,6 +3872,7 @@ async def on_message(message):
                 generate_prompt = None     # GENERATE
                 generate_seed = None       # optional pinned seed (GENERATE-SEED form)
                 tool_call = None           # (tool_name, arg) when [LIST]/[READ]/[ATTACH] detected
+                lyric_payload = None       # [LYRIC] block body when detected
 
                 async for tok in _select_stream(history):
                     full_reply += tok
@@ -3023,6 +3908,18 @@ async def on_message(message):
                                 break
                         if tool_call:
                             break  # exit token loop, handle below
+
+                    # LYRIC sentinel: detect [LYRIC]: <block-payload>...[STOPPED
+                    # Block-shaped (DOTALL) so the payload can span multiple lines
+                    # (TOPIC / DEPTH / REFERENCE verse). Same intercept-and-handle
+                    # pattern as WEBSEARCH/GENERATE.
+                    if (LYRIC_ENABLED and handle_lyric_sentinel is not None
+                            and LYRIC_RE is not None
+                            and lyric_loops < LYRIC_MAX_LOOPS):
+                        L = LYRIC_RE.search(full_reply)
+                        if L:
+                            lyric_payload = L.group(1).strip()
+                            break  # exit token loop, handle sentinel below
 
                     # SOFT_LIMIT split (split long replies across multiple Discord msgs)
                     if len(current_chunk) >= SOFT_LIMIT:
@@ -3075,6 +3972,17 @@ async def on_message(message):
                         if _tm:
                             tool_call = (_tname, _tm.group(1).strip())
                             break
+
+                # Same naked-fallback for [LYRIC]: — model emits the block but
+                # doesn't terminate with [STOPPED. Block-shaped so we grab from
+                # the marker to end-of-stream.
+                if (lyric_payload is None and LYRIC_ENABLED
+                        and handle_lyric_sentinel is not None
+                        and LYRIC_NAKED_RE is not None
+                        and lyric_loops < LYRIC_MAX_LOOPS):
+                    L_naked = LYRIC_NAKED_RE.search(full_reply.rstrip())
+                    if L_naked:
+                        lyric_payload = L_naked.group(1).strip()
 
                 if sentinel_query:
                     # WEBSEARCH path: announce, run search, re-prompt
@@ -3168,6 +4076,79 @@ async def on_message(message):
                                 f"<<<END>>>\n"
                                 f"Generation failed. Tell the operator briefly — most "
                                 f"likely cause is ComfyUI not running or wrong COMFY_HOST."
+                            ),
+                        })
+                    sent_msg = await message.channel.send("⌛ *thinking…*")
+                    continue
+
+                if lyric_payload:
+                    # LYRIC path: announce, run cadence pipeline, re-inject result
+                    lyric_loops += 1
+                    log.info(f"[LYRIC-SENTINEL] ({lyric_loops}/{LYRIC_MAX_LOOPS}) payload={lyric_payload[:120]!r}...")
+                    try:
+                        await sent_msg.delete()
+                    except Exception:
+                        pass
+                    # Announce — capture the message handle so the pipeline can
+                    # stream live progress into it (edit-in-place). Without this,
+                    # the channel goes silent for 1-3 minutes during retries.
+                    lyric_announce = None
+                    try:
+                        lyric_announce = await message.channel.send(
+                            "🎼 *cadence engine spinning up…*"
+                        )
+                    except Exception:
+                        pass
+                    # Build throttled progress callback if we got an announce
+                    # handle. Engine fires status strings at each checkpoint
+                    # (parsing / generation / validation / retry decision).
+                    lyric_on_progress = None
+                    if lyric_announce is not None:
+                        lyric_on_progress = _make_lyric_progress_callback(lyric_announce)
+                    try:
+                        result = await handle_lyric_sentinel(
+                            lyric_payload,
+                            on_progress=lyric_on_progress,
+                        )
+                        # Drop the announce once we have a result — SERVITOR's
+                        # next reply will present the verse and the live status
+                        # line would just clutter above it.
+                        try:
+                            if lyric_announce is not None:
+                                await lyric_announce.delete()
+                        except Exception:
+                            pass
+                        history.append({"role": "assistant", "content": full_reply})
+                        history.append({
+                            "role": "system",
+                            "content": lyric_format_reinjection(result),
+                        })
+                        log.info(
+                            f"[LYRIC-SENTINEL] result ok={result['ok']} "
+                            f"retries={result['retries']} "
+                            f"lines={len(result.get('candidates', []))}"
+                        )
+                    except Exception as exc:
+                        log.exception("[LYRIC-SENTINEL] pipeline failed")
+                        history.append({"role": "assistant", "content": full_reply})
+                        history.append({
+                            "role": "system",
+                            # Directive form — template-shaped re-injection makes
+                            # qwen hallucinate fake [LYRIC_VERIFIED] blocks claiming
+                            # success. Plain prose + explicit DO/DON'T lands as
+                            # instruction. See lyric_engine.format_reinjection().
+                            "content": (
+                                f"The lyric pipeline crashed with an unexpected "
+                                f"exception: {type(exc).__name__}: {str(exc)[:200]}\n\n"
+                                f"INSTRUCTION TO YOU (do not copy this back): tell "
+                                f"the operator the exception type and a one-line "
+                                f"guess at the cause (most likely: ollama down, "
+                                f"missing library/cadence_engine_spec.md, or sentinel "
+                                f"payload missing TOPIC/REFERENCE fields). Do NOT "
+                                f"invent a verse. Do NOT claim anything was generated. "
+                                f"Do NOT emit a fake [LYRIC_VERIFIED] block. Do NOT "
+                                f"emit another [LYRIC] sentinel. There is no verse "
+                                f"to present."
                             ),
                         })
                     sent_msg = await message.channel.send("⌛ *thinking…*")
@@ -3359,4 +4340,5 @@ if __name__ == "__main__":
             "!argue command is loaded but ANTHROPIC_API_KEY is empty. "
             "!argue will return an error until the key is set in .env."
         )
+    setup_claude_relay(bot)
     bot.run(BOT_TOKEN, log_handler=None)
