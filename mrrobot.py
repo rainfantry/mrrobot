@@ -93,17 +93,42 @@ def _clean_for_speech(text):
     c = _tts_re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', c)
     return c.strip()
 
+# ── ElevenLabs voice params — loaded from .env at startup ────────────────────
+def _el_float(key, default):
+    try: return float(os.environ.get(key, default))
+    except ValueError: return float(default)
+
+_EL_STABILITY      = _el_float("EL_STABILITY",  0.30)
+_EL_SIMILARITY     = _el_float("EL_SIMILARITY", 0.80)
+_EL_STYLE          = _el_float("EL_STYLE",      0.55)
+_EL_SPEAKER_BOOST  = os.environ.get("EL_SPEAKER_BOOST", "true").lower() == "true"
+_EL_CAPS_STYLE_ADD = 0.25  # extra style when shouting detected
+
+def _is_caps_shout(text):
+    """True if >60% of alpha chars are uppercase — shout, not acronym."""
+    alpha = [c for c in text if c.isalpha()]
+    if len(alpha) < 6:
+        return False
+    return sum(1 for c in alpha if c.isupper()) / len(alpha) > 0.60
+
 def _fetch_el_pcm(text):
-    """Hit ElevenLabs, return raw PCM bytes or None on any failure."""
-    if not _el_available:
+    """Hit ElevenLabs, return raw PCM bytes or None on any failure.
+    Boosts style when input is predominantly uppercase (shouting)."""
+    if not _el_available or not _EL_API_KEY or not _EL_VOICE_ID:
         return None
     try:
+        style = min(1.0, _EL_STYLE + (_EL_CAPS_STYLE_ADD if _is_caps_shout(text) else 0))
         url  = f"https://api.elevenlabs.io/v1/text-to-speech/{_EL_VOICE_ID}"
         hdrs = {"xi-api-key": _EL_API_KEY, "Content-Type": "application/json"}
         body = {
             "text": text[:5000],
             "model_id": "eleven_multilingual_v2",
-            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+            "voice_settings": {
+                "stability":        _EL_STABILITY,
+                "similarity_boost": _EL_SIMILARITY,
+                "style":            style,
+                "use_speaker_boost": _EL_SPEAKER_BOOST,
+            },
         }
         r = _httpx.post(url, json=body, headers=hdrs,
                         params={"output_format": "pcm_22050"}, timeout=30)
