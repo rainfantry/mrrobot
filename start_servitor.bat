@@ -146,9 +146,61 @@ if /i "%VISION_MODEL_NAME%"=="%MODEL_NAME%" (
     )
 )
 
-REM ---- Step 4: Launch the bot ----
+REM ---- Step 4: Prereq + TTS checks ----
 echo.
-echo [4/4] Launching SERVITOR bot in new window...
+echo [4/5] Checking venv prerequisites and TTS endpoints...
+
+REM -- pyttsx3 (SAPI fallback)
+.\venv\Scripts\python.exe -c "import pyttsx3" >NUL 2>&1
+if errorlevel 1 (
+    echo   [WARN] pyttsx3 not installed in venv - installing now...
+    .\venv\Scripts\python.exe -m pip install pyttsx3 --quiet
+) else (
+    echo   [OK]   pyttsx3 (SAPI fallback)
+)
+
+REM -- httpx (ElevenLabs transport)
+.\venv\Scripts\python.exe -c "import httpx" >NUL 2>&1
+if errorlevel 1 (
+    echo   [WARN] httpx not installed in venv - installing now...
+    .\venv\Scripts\python.exe -m pip install httpx --quiet
+) else (
+    echo   [OK]   httpx (ElevenLabs transport)
+)
+
+REM -- Read EL config from .env
+set "EL_API_KEY="
+set "EL_VOICE_ID="
+if exist "%~dp0.env" (
+    for /f "tokens=1,* delims==" %%A in ('findstr /B /C:"EL_API_KEY=" "%~dp0.env"') do set "EL_API_KEY=%%B"
+    for /f "tokens=1,* delims==" %%A in ('findstr /B /C:"EL_VOICE_ID=" "%~dp0.env"') do set "EL_VOICE_ID=%%B"
+)
+
+REM -- Hit ElevenLabs voice endpoint (lightweight auth check, no audio generated)
+if defined EL_API_KEY (
+    if defined EL_VOICE_ID (
+        echo   Checking ElevenLabs voice endpoint...
+        curl -s -o NUL -w "%%{http_code}" --max-time 8 ^
+            -H "xi-api-key: %EL_API_KEY%" ^
+            "https://api.elevenlabs.io/v1/voices/%EL_VOICE_ID%" > "%TEMP%\el_check.txt" 2>NUL
+        set /p EL_STATUS=<"%TEMP%\el_check.txt"
+        del "%TEMP%\el_check.txt" >NUL 2>&1
+        if "%EL_STATUS%"=="200" (
+            echo   [OK]   ElevenLabs ^(voice ID %EL_VOICE_ID:~0,8%...^) responding
+        ) else (
+            echo   [WARN] ElevenLabs returned HTTP %EL_STATUS% - TTS will fall back to SAPI
+            echo          Check EL_API_KEY / EL_VOICE_ID in .env
+        )
+    ) else (
+        echo   [WARN] EL_VOICE_ID not set in .env - ElevenLabs TTS disabled
+    )
+) else (
+    echo   [WARN] EL_API_KEY not set in .env - ElevenLabs TTS disabled
+)
+
+REM ---- Step 5: Launch the bot ----
+echo.
+echo [5/5] Launching SERVITOR bot in new window...
 start "SERVITOR" cmd /k ".\venv\Scripts\python.exe mrrobot.py"
 
 echo.

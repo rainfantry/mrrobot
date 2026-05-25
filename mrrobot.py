@@ -58,9 +58,9 @@ import re as _tts_re
 _tts_lock = threading.Lock()
 _tts_enabled = False  # off by default — toggle with !tts
 
-# ── ElevenLabs (primary) ─────────────────────────────────────────────────────
-_EL_API_KEY  = "sk_17f2769b5650524a320f7bb3ca7132e5b0e2cb6031b3a0a9"
-_EL_VOICE_ID = "twLPF55UcxNYRmxaWLAn"
+# ── ElevenLabs (primary) — configure in .env, not here ──────────────────────
+_EL_API_KEY  = os.environ.get("EL_API_KEY", "")
+_EL_VOICE_ID = os.environ.get("EL_VOICE_ID", "")
 _EL_RATE     = 22050  # pcm_22050
 _el_available = False
 try:
