@@ -21,13 +21,13 @@ if u dont have python, ollama, a venv, a discord bot, or any of this yet — sta
 - gpu is optional but heavily recommended. nvidia preferred. 8gb+ vram lets u run 7b models smoothly. cpu-only works but slow (1-5 tok/s)
 - internet for the one-time downloads
 
-### 1. install python 3.12
+### 1. install python
 
-newer pythons (3.13/3.14) break some ml deps. stick with 3.12.
+python 3.12 or newer. 3.14 is what this is tested on. just tick **"add python to PATH"** during install.
 
 1. download installer from https://python.org/downloads
 2. tick **"add python to PATH"** during install
-3. verify in powershell: `py -3.12 --version` → should print `Python 3.12.x`
+3. verify in powershell: `python --version` → should print `Python 3.x.x`
 
 ### 2. install ollama
 
@@ -63,26 +63,21 @@ these are the defaults referenced in `.env.example`. coder = text chat. vl = vis
 ```
 git clone https://github.com/rainfantry/mrrobot.git
 cd mrrobot
-py -3.12 -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
 ```
 
-(on linux/mac: `source venv/bin/activate` instead of the .bat path)
+then double-click **`setup.bat`**. it handles everything:
+- creates the venv
+- installs requirements.txt
+- copies `.env.example` → `.env` and opens it in notepad
+- checks if Ollama is running (and if it's remote, tells u the firewall commands needed)
+- validates ElevenLabs TTS key/voice if configured
 
-### 6. configure .env
-
-```
-copy .env.example .env
-notepad .env
-```
-
-minimum fields to set:
+minimum fields to fill in `.env`:
 - `DISCORD_BOT_TOKEN=` — paste the token from step 4
-- `WHITELIST_USERS=` — ur discord username in lowercase, e.g. `WHITELIST_USERS=jewge`
+- `WHITELIST_USERS=` — ur discord username in lowercase, e.g. `jewge`
 - everything else has sensible defaults
 
-save + close notepad.
+save + close notepad when done.
 
 ### 7. (optional) install comfyui for `!gen` image generation
 
@@ -247,7 +242,33 @@ free, private, but on a 4GB GPU it'll dump to CPU and take 10+ min.
 
 text never leaves ur rig. only the image + ur question goes to anthropic when cloud vision is on.
 
-### 5.3 !argue (argument analyser)
+### 5.3 !tts (ElevenLabs voice)
+
+when enabled, every bot reply is spoken aloud on the host machine AND uploaded to the discord channel as a playable WAV — so anyone on any device can hear it.
+
+**toggle:**
+```
+!tts          ← on/off switch (shows current state)
+```
+
+**direct speak (no LLM involved):**
+```
+!tts say this out loud right now
+```
+
+**caps = louder/more expressive:** text with >60% uppercase chars gets boosted style automatically.
+
+**setup:** add to `.env`:
+```ini
+EL_API_KEY=sk_...        # from https://elevenlabs.io > Profile > API Key
+EL_VOICE_ID=twLPF5...   # from https://elevenlabs.io > Voices > copy ID
+```
+
+all voice params are in `.env` — see §10 for the full list. if ElevenLabs is unreachable, falls back to Windows SAPI (Zira voice).
+
+---
+
+### 5.4 !argue (argument analyser)
 
 paste a discord conversation, i analyse it and give u deployable counter-args in ur voice. routes to claude-haiku via anthropic by default.
 
@@ -279,7 +300,7 @@ OR reply to a discord msg with just `!argue` (or `!argue --local`) and i pull th
 | `ARGUE_MODEL` | `claude-haiku-4-5` | switch to `claude-sonnet-4-6` for sharper analysis |
 | `ARGUE_MAX_TOKENS` | `2048` | max output length |
 
-### 5.3.1 findings — why u should default to cloud for !argue
+### 5.4.1 findings — why u should default to cloud for !argue
 
 i benchmarked both routes on the same discord convo, same system prompt. results:
 
@@ -299,7 +320,7 @@ i benchmarked both routes on the same discord convo, same system prompt. results
 
 ---
 
-### 5.4 !gen (ComfyUI image generation bridge)
+### 5.5 !gen (ComfyUI image generation bridge)
 
 pipe a text prompt to ur local ComfyUI install, post the generated image back to the channel. fully local — no API calls leave ur rig. whitelist-gated.
 
@@ -357,7 +378,7 @@ Saves `test_gen.png` next to the script if successful, prints error otherwise. F
 
 **privacy note:** generated images post to the channel where u invoked `!gen`. anyone in that channel sees them. for sensitive subjects (e.g. real-person face LoRAs), only invoke from channels u fully control or DM-style channels.
 
-### 5.4.1 natural-language gen (no `!gen` needed)
+### 5.5.1 natural-language gen (no `!gen` needed)
 
 i can also generate images from conversational requests. just say what u want in natural english:
 
@@ -424,8 +445,10 @@ prefix is `!servitor ` for the formal commands. some shortcuts work without it.
 | `!skip`, `skip`, `next` | whitelist | silent cancel (deletes partial) |
 | `who has auth`, `whitelist`, `!auth` | whitelist | show auth roster |
 | `shortcuts`, `!shortcuts`, `!help` | whitelist | show this command list in-channel |
+| `!tts` | whitelist | toggle ElevenLabs voice on/off — see §5.3 |
+| `!tts <text>` | whitelist | speak text immediately (no LLM, direct to voice) |
 | `!argue <convo>` | whitelist | argument analyser via anthropic |
-| `!gen <prompt>` | whitelist | local ComfyUI image generation — see §5.4 |
+| `!gen <prompt>` | whitelist | local ComfyUI image generation — see §5.5 |
 | `!gen --seed <int> <prompt>` | whitelist | same, with fixed seed for reproducible composition |
 
 ### 7.3 trigger words (for non-whitelist roles)
@@ -533,7 +556,7 @@ see `.env.example` for the template. paste it to `.env` and fill in.
 | var | default | what |
 |---|---|---|
 | `DISCORD_BOT_TOKEN` | — | required. from developer portal |
-| `OLLAMA_URL` | `http://localhost:11434/api/chat` | local ollama endpoint |
+| `OLLAMA_URL` | `http://localhost:11434/api/chat` | ollama endpoint — can be remote IP (e.g. `http://192.168.1.10:11434/api/chat`). remote requires port 11434 open on that machine's firewall and `OLLAMA_HOST=0.0.0.0` set before starting ollama |
 | `MODEL_NAME` | `huihui_ai/qwen2.5-coder-abliterate:7b` | the coder brain |
 | `VISION_MODEL_NAME` | `huihui_ai/qwen2.5-vl-abliterated:7b` | local OR `anthropic:claude-haiku-4-5` |
 | `ANTHROPIC_API_KEY` | (empty) | required if VISION or !argue uses cloud |
@@ -556,8 +579,14 @@ see `.env.example` for the template. paste it to `.env` and fill in.
 | `COMFY_TIMEOUT_SEC` | `300` | max wait per !gen call |
 | `COMFY_POLL_INTERVAL` | `1.0` | how often to poll /history for completion |
 | `TRIGGER_TOKEN` | `sks_woman, woman` | auto-prepended to !gen prompts if missing |
-| `GENERATE_ENABLED` | `true` | enable natural-language gen via `[GENERATE]:` sentinel — see §5.4.1 |
+| `GENERATE_ENABLED` | `true` | enable natural-language gen via `[GENERATE]:` sentinel — see §5.5.1 |
 | `GENERATE_MAX_LOOPS` | `2` | max image generations per single user turn |
+| `EL_API_KEY` | (empty) | ElevenLabs API key — https://elevenlabs.io > Profile > API Key |
+| `EL_VOICE_ID` | (empty) | ElevenLabs voice ID — copy from voice URL on elevenlabs.io |
+| `EL_STABILITY` | `0.30` | voice consistency: 0=expressive/varied, 1=robotic. lower = more human-sounding |
+| `EL_SIMILARITY` | `0.80` | how close to the original voice clone (0.75-0.85 is the sweet spot) |
+| `EL_STYLE` | `0.55` | style exaggeration: 0=flat, 1=theatrical. CAPS text adds 0.25 automatically |
+| `EL_SPEAKER_BOOST` | `true` | extra voice clarity enhancement |
 
 ---
 
@@ -571,7 +600,8 @@ mrrobot/
   gen_template.json     # ComfyUI API-format workflow template (hot-editable)
   web_search.py         # duckduckgo wrapper for the [WEBSEARCH] sentinel
   system_prompt.txt     # ur live editable prompt — gitignored, private
-  start_servitor.bat    # launcher: prompt menu + ollama warmup + bot start
+  setup.bat             # first-time setup: venv + deps + .env + network check
+  start_servitor.bat    # launcher: prompt menu + ollama warmup + prereq checks + bot start
                         # auto-reads MODEL_NAME / VISION_MODEL_NAME from .env
   stop_servitor.bat     # kills me
   requirements.txt
@@ -626,15 +656,19 @@ ollama list
 ### 13.2 python env
 
 ```bash
-# python 3.10 or newer required
 git clone https://github.com/rainfantry/mrrobot.git
 cd mrrobot
+```
 
-python -m venv venv
-venv\Scripts\activate          # windows
-# source venv/bin/activate     # linux/mac
+**windows:** double-click `setup.bat` — handles venv, pip, .env, and all checks automatically.
 
+**linux/mac (manual):**
+```bash
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
+nano .env   # fill in DISCORD_BOT_TOKEN + WHITELIST_USERS at minimum
 ```
 
 ### 13.3 discord developer portal — the part nobody documents properly
