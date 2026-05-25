@@ -559,6 +559,31 @@ EXECUTE."""
 # SYSTEM_PROMPT_BASELINE above is the embedded factory baseline — never deleted.
 # Launcher uses `python mrrobot.py --dump-baseline` to restore the file.
 _PROMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system_prompt.txt")
+_ASF_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "asf_framework.txt")
+
+# Keywords that trigger full ASF file injection into the system prompt for that turn.
+_ASF_KEYWORDS = {
+    "asf", "adversarial survival", "vader calculus", "china principle",
+    "hatred hierarchy", "tier 1", "tier 2", "tier 3", "hatred fuel",
+    "halt doctrine", "asf doctrine", "asf framework", "adversarial framework",
+    "pte wu", "22div", "doctrine",
+}
+
+def _asf_triggered(messages):
+    """True if the latest user message contains any ASF trigger keyword."""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            text = (msg.get("content") or "").lower()
+            return any(kw in text for kw in _ASF_KEYWORDS)
+    return False
+
+def _load_asf_framework():
+    """Load asf_framework.txt from disk. Returns empty string if missing."""
+    try:
+        with open(_ASF_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
 
 
 def _load_system_prompt():
@@ -2133,8 +2158,19 @@ def _pick_model(messages):
 def _pick_system_prompt(messages):
     """Minimal vision-side prompt when images are present, otherwise full persona
     (hot-reloaded from disk on file change). Small vision models choke on
-    persona-heavy prompts so vision keeps its own static minimal prompt."""
-    return VISION_SYSTEM_PROMPT if _has_images(messages) else _get_live_system_prompt()
+    persona-heavy prompts so vision keeps its own static minimal prompt.
+
+    When ASF trigger keywords are detected in the latest user message, the full
+    asf_framework.txt is appended to the system prompt for that turn only."""
+    if _has_images(messages):
+        return VISION_SYSTEM_PROMPT
+    base = _get_live_system_prompt()
+    if _asf_triggered(messages):
+        asf = _load_asf_framework()
+        if asf:
+            log.info("[ASF] Trigger detected — injecting asf_framework.txt (%d chars)", len(asf))
+            return base + "\n\n" + asf
+    return base
 
 
 async def query_ollama(messages):

@@ -62,6 +62,10 @@ test_gen*.png
 # Bot reads it at startup with a fallback to SYSTEM_PROMPT_BASELINE in mrrobot.py.
 # Covers system_prompt.txt + any backup variants (timestamped, "- Copy", .bak, etc).
 system_prompt*.txt
+prompt_*.txt
+
+# ASF (Adversarial Survival Framework) — personal psychological framework, private.
+asf_framework.txt
 
 # Pre-extraction backups (safe to delete once the new layout is trusted)
 *.bak_pre_extract
