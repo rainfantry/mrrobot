@@ -567,6 +567,9 @@ _ASF_KEYWORDS = {
     "hatred hierarchy", "tier 1", "tier 2", "tier 3", "hatred fuel",
     "halt doctrine", "asf doctrine", "asf framework", "adversarial framework",
     "pte wu", "22div", "doctrine",
+    # natural-language triggers — fire the full framework on these
+    "hatred", "who is the enemy", "the enemy", "named enemy", "fuel source",
+    "hate them", "hate the", "tier system", "the hatred",
 }
 
 def _asf_triggered(messages):

@@ -63,6 +63,8 @@ test_gen*.png
 # Covers system_prompt.txt + any backup variants (timestamped, "- Copy", .bak, etc).
 system_prompt*.txt
 prompt_*.txt
+# Exception: the public template is tracked so cloners have a starting point.
+!system_prompt.example.txt
 
 # ASF (Adversarial Survival Framework) — personal psychological framework, private.
 asf_framework.txt
