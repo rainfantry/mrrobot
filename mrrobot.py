@@ -52,6 +52,7 @@ import tempfile
 import wave
 import io
 import os
+import asyncio as _tts_asyncio
 import re as _tts_re
 
 _tts_lock = threading.Lock()
@@ -60,7 +61,7 @@ _tts_enabled = False  # off by default — toggle with !tts
 # ── ElevenLabs (primary) ─────────────────────────────────────────────────────
 _EL_API_KEY  = "sk_17f2769b5650524a320f7bb3ca7132e5b0e2cb6031b3a0a9"
 _EL_VOICE_ID = "twLPF55UcxNYRmxaWLAn"
-_EL_RATE     = 22050  # pcm_22050 output format
+_EL_RATE     = 22050  # pcm_22050
 _el_available = False
 try:
     import httpx as _httpx
@@ -92,12 +93,11 @@ def _clean_for_speech(text):
     c = _tts_re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', c)
     return c.strip()
 
-def _speak_el(text):
-    """Call ElevenLabs, play PCM via winsound. Returns True on success."""
+def _fetch_el_pcm(text):
+    """Hit ElevenLabs, return raw PCM bytes or None on any failure."""
     if not _el_available:
-        return False
+        return None
     try:
-        import winsound as _ws
         url  = f"https://api.elevenlabs.io/v1/text-to-speech/{_EL_VOICE_ID}"
         hdrs = {"xi-api-key": _EL_API_KEY, "Content-Type": "application/json"}
         body = {
@@ -107,28 +107,14 @@ def _speak_el(text):
         }
         r = _httpx.post(url, json=body, headers=hdrs,
                         params={"output_format": "pcm_22050"}, timeout=30)
-        if r.status_code != 200:
-            return False
-        # Wrap raw PCM in a WAV container (stdlib only)
-        buf = io.BytesIO()
-        with wave.open(buf, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)        # 16-bit
-            wf.setframerate(_EL_RATE)
-            wf.writeframes(r.content)
-        tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-        tmp.write(buf.getvalue()); tmp.close()
-        try:
-            _ws.PlaySound(tmp.name, _ws.SND_FILENAME)
-        finally:
-            try: os.unlink(tmp.name)
-            except Exception: pass
-        return True
+        return r.content if r.status_code == 200 else None
     except Exception:
-        return False
+        return None
 
-def speak(text):
-    """Speak text — ElevenLabs primary, SAPI/pyttsx3 fallback."""
+def speak(text, channel=None, loop=None):
+    """Speak text — ElevenLabs primary, SAPI fallback.
+    If channel + loop supplied, also uploads the WAV to Discord so it plays
+    on every device. File is deleted immediately after upload completes."""
     if not _tts_enabled:
         return
     def _run():
@@ -136,7 +122,40 @@ def speak(text):
             clean = _clean_for_speech(text)
             if not clean:
                 return
-            if not _speak_el(clean):
+            pcm = _fetch_el_pcm(clean)
+            if pcm is not None:
+                # Build WAV in memory (stdlib wave, no extra deps)
+                buf = io.BytesIO()
+                with wave.open(buf, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(_EL_RATE)
+                    wf.writeframes(pcm)
+                tmp = tempfile.NamedTemporaryFile(
+                    prefix='mrrobot_tts_', suffix='.wav', delete=False)
+                tmp.write(buf.getvalue()); tmp.close()
+                try:
+                    import winsound as _ws
+                    import discord as _dc
+                    # Kick off Discord upload in parallel with local playback
+                    upload_fut = None
+                    if channel is not None and loop is not None:
+                        async def _upload():
+                            await channel.send(
+                                file=_dc.File(tmp.name, filename="voice.wav"))
+                        upload_fut = _tts_asyncio.run_coroutine_threadsafe(
+                            _upload(), loop)
+                    # Play locally (blocks until done)
+                    _ws.PlaySound(tmp.name, _ws.SND_FILENAME)
+                    # Wait for upload to finish before deleting
+                    if upload_fut is not None:
+                        try: upload_fut.result(timeout=15)
+                        except Exception: pass
+                finally:
+                    try: os.unlink(tmp.name)
+                    except Exception: pass
+            else:
+                # SAPI fallback — local only
                 if _sapi_available:
                     _tts_init_sapi()
                     _tts_engine.say(clean[:2000])
@@ -3776,7 +3795,8 @@ async def on_message(message):
         if tts_text:
             # Direct speak mode — say the text, don't touch toggle
             log.info(f"[TTS] direct speak ({len(tts_text)} chars) by {message.author.name}")
-            speak(tts_text)
+            speak(tts_text, channel=message.channel,
+                  loop=_tts_asyncio.get_event_loop())
             await message.channel.send(f"🔊 *speaking…*")
         else:
             # Bare command — toggle auto-speak on/off
@@ -4357,7 +4377,8 @@ async def on_message(message):
                 # model is emitting tool sentinels but mis-formatted (regex miss),
                 # or just refusing/chitchatting (model issue).
                 log.info(f"[REPLY-PREVIEW] {full_reply[:300]!r}")
-                speak(full_reply)
+                speak(full_reply, channel=message.channel,
+                      loop=_tts_asyncio.get_event_loop())
                 break
 
         except asyncio.CancelledError:
