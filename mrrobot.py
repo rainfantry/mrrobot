@@ -46,6 +46,48 @@ try:
 except ImportError:
     AsyncAnthropic = None
 
+# Windows SAPI TTS via pyttsx3
+try:
+    import pyttsx3
+    import threading
+    _tts_engine = None
+    _tts_lock = threading.Lock()
+    _tts_enabled = False  # off by default — toggle with !tts
+
+    def _tts_init():
+        global _tts_engine
+        if _tts_engine is None:
+            _tts_engine = pyttsx3.init()
+            _tts_engine.setProperty('rate', 170)
+            _tts_engine.setProperty('volume', 1.0)
+            voices = _tts_engine.getProperty('voices')
+            # prefer first English voice (Zira)
+            en = [v for v in voices if 'en' in (v.languages[0] if v.languages else '')]
+            _tts_engine.setProperty('voice', en[0].id if en else voices[0].id)
+
+    def speak(text):
+        """Speak text via SAPI in a background thread so it doesn't block the bot."""
+        if not _tts_enabled:
+            return
+        def _run():
+            with _tts_lock:
+                _tts_init()
+                # strip markdown symbols before speaking
+                import re as _re
+                clean = _re.sub(r'[*_`#>~|]', '', text)
+                clean = _re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', clean)  # links
+                clean = clean.strip()
+                if clean:
+                    _tts_engine.say(clean[:2000])
+                    _tts_engine.runAndWait()
+        threading.Thread(target=_run, daemon=True).start()
+
+    _sapi_available = True
+except ImportError:
+    _sapi_available = False
+    _tts_enabled = False
+    def speak(text): pass
+
 try:
     from argue import analyse as argue_analyse, analyse_local as argue_analyse_local
 except ImportError:
@@ -537,6 +579,7 @@ FREEZE_PHRASES  = ("!freeze", "!freezeee", "!freeze-persona", "/freeze", "!bake"
 PERSONA_PHRASES = ("!persona", "!buildpersona", "!createpersona", "/persona")
 SAVE_PROMPT_PHRASES = ("!save", "!savepersona", "!savereply", "/save", "!bake-reply")
 HELP_PHRASES    = ("!help", "/help", "!commands", "!cheatsheet", "!?")
+TTS_PHRASES     = ("!tts", "/tts", "!speak", "!voice")
 
 # Which model writes the persona text when !persona is fired.
 # Default to abliterated so it'll write profane / explicit / weird personas without
@@ -1609,6 +1652,11 @@ def is_save_command(content):
 def is_help_command(content):
     """!help / !commands / !cheatsheet — dump available commands."""
     return _is_phrase_prefix(content, HELP_PHRASES)[0] is not None
+
+
+def is_tts_command(content):
+    """!tts / !speak / !voice — toggle Windows SAPI TTS on/off."""
+    return _is_phrase_prefix(content, TTS_PHRASES)[0] is not None
 
 
 # Authoritative command reference. Used by !help direct command AND injected
@@ -3661,6 +3709,30 @@ async def on_message(message):
                 break
         return
 
+    # TTS handler: "!tts <text>" speaks immediately; bare "!tts" toggles auto-speak
+    if is_whitelisted(message.author) and is_tts_command(message.content):
+        # Strip the trigger word and grab any trailing text
+        raw = message.content.strip()
+        tts_text = None
+        for phrase in TTS_PHRASES:
+            if raw.lower().startswith(phrase):
+                tts_text = raw[len(phrase):].strip()
+                break
+        if tts_text:
+            # Direct speak mode — say the text, don't touch toggle
+            log.info(f"[TTS] direct speak ({len(tts_text)} chars) by {message.author.name}")
+            speak(tts_text)
+            await message.channel.send(f"🔊 *speaking…*")
+        else:
+            # Bare command — toggle auto-speak on/off
+            global _tts_enabled
+            _tts_enabled = not _tts_enabled
+            status = "ON 🔊" if _tts_enabled else "OFF 🔇"
+            voice_name = "SAPI/pyttsx3" if _sapi_available else "unavailable (pyttsx3 not installed)"
+            log.info(f"[TTS] toggled {status} by {message.author.name}")
+            await message.channel.send(f"TTS {status} — {voice_name}")
+        return
+
     # AUTH handler: list whitelisted operators (whitelist-only, no LLM)
     if is_whitelisted(message.author) and _matches(message.content, AUTH_PHRASES):
         log.info(f"AUTH query by {message.author.name}")
@@ -4225,6 +4297,7 @@ async def on_message(message):
                 # model is emitting tool sentinels but mis-formatted (regex miss),
                 # or just refusing/chitchatting (model issue).
                 log.info(f"[REPLY-PREVIEW] {full_reply[:300]!r}")
+                speak(full_reply)
                 break
 
         except asyncio.CancelledError:
