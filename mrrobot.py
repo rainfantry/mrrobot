@@ -706,6 +706,7 @@ FREEZE_PHRASES  = ("!freeze", "!freezeee", "!freeze-persona", "/freeze", "!bake"
 PERSONA_PHRASES = ("!persona", "!buildpersona", "!createpersona", "/persona")
 SAVE_PROMPT_PHRASES = ("!save", "!savepersona", "!savereply", "/save", "!bake-reply")
 HELP_PHRASES    = ("!help", "/help", "!commands", "!cheatsheet", "!?")
+MODE_PHRASES    = ("!mode", "/mode", "!prompt-mode", "!pm")
 TTS_PHRASES     = ("!tts", "/tts", "!speak", "!voice")
 
 # Which model writes the persona text when !persona is fired.
@@ -1785,6 +1786,10 @@ def is_tts_command(content):
     """!tts / !speak / !voice — toggle Windows SAPI TTS on/off."""
     return _is_phrase_prefix(content, TTS_PHRASES)[0] is not None
 
+def is_mode_command(content):
+    """!mode <name> — swap active system prompt without bot restart."""
+    return _is_phrase_prefix(content, MODE_PHRASES)[0] is not None
+
 
 # Authoritative command reference. Used by !help direct command AND injected
 # into LLM context when operator asks free-form help questions.
@@ -1916,6 +1921,13 @@ Both bake a `[STOPPED` stop token + tuned sampling params.
 `!model <text|vision> <full-name>`   — swap to any installed ollama model
 Only ONE model per lane active at a time — old one unloaded before new one warms.
 Next chat msg / image upload cold-loads (~10-30s); subsequent fast.
+
+**Prompt Mode Switcher:**
+`!mode`                    — list available modes + file status
+`!mode servitor`           — SERVITOR war-engine persona
+`!mode tafe`               — TAFE ICT Analysis aggressive tutor
+`!mode lyrical`            — Lyrical Forge, pure image generation
+Hot-reload fires on next message — no restart needed.
 
 **Other:**
 `!help` / `!commands`      — this reference
@@ -3382,6 +3394,45 @@ async def on_message(message):
             f"  • Unload: {unload_result.strip()}\n"
             f"\n*{next_action} (~10-30s first call)*"
         ))
+        return
+
+    if is_whitelisted(message.author) and is_mode_command(message.content):
+        _, args = _is_phrase_prefix(message.content, MODE_PHRASES)
+        _mode_map = {
+            "servitor": "prompt_servitor.txt",
+            "tafe":     "prompt_tafe_ict_analysis.txt",
+            "lyrical":  "prompt_lyrical.txt",
+        }
+        if not args or args.strip().lower() in ("list", ""):
+            lines = ["**Prompt modes:**"]
+            for name, fname in _mode_map.items():
+                exists = os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), fname))
+                status = "✓" if exists else "✗ not found"
+                lines.append(f"  `!mode {name}` — {fname} [{status}]")
+            lines.append("\n*Hot-reload active — fires on next message, no restart.*")
+            await message.channel.send("\n".join(lines))
+            return
+        target = args.strip().lower()
+        if target not in _mode_map:
+            await message.channel.send(
+                f"*[unknown mode `{target}` — available: {', '.join(f'`{k}`' for k in _mode_map)}]*"
+            )
+            return
+        src_name = _mode_map[target]
+        src_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), src_name)
+        dst_path = _PROMPT_FILE
+        if not os.path.exists(src_path):
+            hint = ""
+            if target == "servitor":
+                hint = "\n  Save your SERVITOR prompt as `prompt_servitor.txt` first."
+            elif target == "lyrical":
+                hint = "\n  Copy `prompt_lyrical.example.txt` → `prompt_lyrical.txt` first."
+            await message.channel.send(f"*[`{src_name}` not found.{hint}]*")
+            return
+        import shutil
+        shutil.copy2(src_path, dst_path)
+        log.info(f"[!MODE] {message.author.name} switched to {target!r} ({src_name})")
+        await message.channel.send(f"*[mode → **{target}** | hot-reload active]*")
         return
 
     if is_whitelisted(message.author) and is_save_command(message.content):
