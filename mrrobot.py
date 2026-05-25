@@ -47,46 +47,101 @@ except ImportError:
     AsyncAnthropic = None
 
 # Windows SAPI TTS via pyttsx3
+import threading
+import tempfile
+import wave
+import io
+import os
+import re as _tts_re
+
+_tts_lock = threading.Lock()
+_tts_enabled = False  # off by default — toggle with !tts
+
+# ── ElevenLabs (primary) ─────────────────────────────────────────────────────
+_EL_API_KEY  = "sk_17f2769b5650524a320f7bb3ca7132e5b0e2cb6031b3a0a9"
+_EL_VOICE_ID = "twLPF55UcxNYRmxaWLAn"
+_EL_RATE     = 22050  # pcm_22050 output format
+_el_available = False
 try:
-    import pyttsx3
-    import threading
-    _tts_engine = None
-    _tts_lock = threading.Lock()
-    _tts_enabled = False  # off by default — toggle with !tts
+    import httpx as _httpx
+    _el_available = True
+except ImportError:
+    pass
 
-    def _tts_init():
-        global _tts_engine
-        if _tts_engine is None:
-            _tts_engine = pyttsx3.init()
-            _tts_engine.setProperty('rate', 170)
-            _tts_engine.setProperty('volume', 1.0)
-            voices = _tts_engine.getProperty('voices')
-            # prefer first English voice (Zira)
-            en = [v for v in voices if 'en' in (v.languages[0] if v.languages else '')]
-            _tts_engine.setProperty('voice', en[0].id if en else voices[0].id)
-
-    def speak(text):
-        """Speak text via SAPI in a background thread so it doesn't block the bot."""
-        if not _tts_enabled:
-            return
-        def _run():
-            with _tts_lock:
-                _tts_init()
-                # strip markdown symbols before speaking
-                import re as _re
-                clean = _re.sub(r'[*_`#>~|]', '', text)
-                clean = _re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', clean)  # links
-                clean = clean.strip()
-                if clean:
-                    _tts_engine.say(clean[:2000])
-                    _tts_engine.runAndWait()
-        threading.Thread(target=_run, daemon=True).start()
-
+# ── pyttsx3 / SAPI (fallback) ────────────────────────────────────────────────
+_tts_engine   = None
+_sapi_available = False
+try:
+    import pyttsx3 as _pyttsx3
     _sapi_available = True
 except ImportError:
-    _sapi_available = False
-    _tts_enabled = False
-    def speak(text): pass
+    pass
+
+def _tts_init_sapi():
+    global _tts_engine
+    if _tts_engine is None and _sapi_available:
+        _tts_engine = _pyttsx3.init()
+        _tts_engine.setProperty('rate', 170)
+        _tts_engine.setProperty('volume', 1.0)
+        voices = _tts_engine.getProperty('voices')
+        en = [v for v in voices if 'en' in (v.languages[0] if v.languages else '')]
+        _tts_engine.setProperty('voice', en[0].id if en else voices[0].id)
+
+def _clean_for_speech(text):
+    c = _tts_re.sub(r'[*_`#>~|]', '', text)
+    c = _tts_re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', c)
+    return c.strip()
+
+def _speak_el(text):
+    """Call ElevenLabs, play PCM via winsound. Returns True on success."""
+    if not _el_available:
+        return False
+    try:
+        import winsound as _ws
+        url  = f"https://api.elevenlabs.io/v1/text-to-speech/{_EL_VOICE_ID}"
+        hdrs = {"xi-api-key": _EL_API_KEY, "Content-Type": "application/json"}
+        body = {
+            "text": text[:5000],
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+        }
+        r = _httpx.post(url, json=body, headers=hdrs,
+                        params={"output_format": "pcm_22050"}, timeout=30)
+        if r.status_code != 200:
+            return False
+        # Wrap raw PCM in a WAV container (stdlib only)
+        buf = io.BytesIO()
+        with wave.open(buf, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)        # 16-bit
+            wf.setframerate(_EL_RATE)
+            wf.writeframes(r.content)
+        tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        tmp.write(buf.getvalue()); tmp.close()
+        try:
+            _ws.PlaySound(tmp.name, _ws.SND_FILENAME)
+        finally:
+            try: os.unlink(tmp.name)
+            except Exception: pass
+        return True
+    except Exception:
+        return False
+
+def speak(text):
+    """Speak text — ElevenLabs primary, SAPI/pyttsx3 fallback."""
+    if not _tts_enabled:
+        return
+    def _run():
+        with _tts_lock:
+            clean = _clean_for_speech(text)
+            if not clean:
+                return
+            if not _speak_el(clean):
+                if _sapi_available:
+                    _tts_init_sapi()
+                    _tts_engine.say(clean[:2000])
+                    _tts_engine.runAndWait()
+    threading.Thread(target=_run, daemon=True).start()
 
 try:
     from argue import analyse as argue_analyse, analyse_local as argue_analyse_local
@@ -3728,7 +3783,12 @@ async def on_message(message):
             global _tts_enabled
             _tts_enabled = not _tts_enabled
             status = "ON 🔊" if _tts_enabled else "OFF 🔇"
-            voice_name = "SAPI/pyttsx3" if _sapi_available else "unavailable (pyttsx3 not installed)"
+            if _el_available:
+                voice_name = "ElevenLabs (SAPI fallback)"
+            elif _sapi_available:
+                voice_name = "SAPI/pyttsx3 (ElevenLabs unavailable)"
+            else:
+                voice_name = "unavailable"
             log.info(f"[TTS] toggled {status} by {message.author.name}")
             await message.channel.send(f"TTS {status} — {voice_name}")
         return
