@@ -842,3 +842,18 @@ ur not alone. the council is up.
 ---
 
 *license: private. dont fork. no contributions. mine.*
+
+---
+
+## TODO — Release Blackops
+
+_Automated read-only assessment — what a full public-release pass would do for this repo. Suggestions only; nothing above has been changed or removed._
+
+- [ ] Audit git history for AI/Claude attribution; scrub if any is found.
+- [ ] Add discovery topics for SEO (`gh repo edit --add-topic ...`, up to 20).
+- [ ] Cut a tagged release (`v1.0.0`); attach a build artifact if this ships a binary/app.
+- [ ] Add a screenshot or diagram to the README if there's a GUI or visual output.
+- [ ] Verify a clean from-scratch build/run against the README quick start (produce a real artifact, don't trust the docs).
+- [ ] If this is a desktop app, make a self-contained build (bundle runtime assets/models into the binary; confirm it runs with no external files).
+
+<sub>Workflow: https://github.com/rainfantry/release-blackops-skill</sub>
